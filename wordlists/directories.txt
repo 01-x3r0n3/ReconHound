@@ -1,0 +1,141 @@
+# reconhound/wordlists/directories.txt
+#
+# General-purpose directory + file wordlist consumed by
+# reconhound/endpoint_discovery.py (context.md §10 module 10, §11 folder
+# structure). One combined list covers both Module-10 responsibility 1
+# (directory enumeration) and responsibility 2 (file enumeration) — this is
+# the single "directories.txt" context.md's folder structure defines; no
+# extra wordlist file is invented for files.
+#
+# Convention read by endpoint_discovery.py:
+#   - entries ending in "/" are treated as directory candidates (recursion
+#     candidates on a non-404 hit)
+#   - all other entries are treated as file/leaf candidates
+#
+# Blank lines and lines starting with "#" are ignored.
+
+# --- common directories ---
+admin/
+administrator/
+api/
+app/
+assets/
+backup/
+backups/
+bin/
+cache/
+cgi-bin/
+config/
+console/
+data/
+db/
+debug/
+dist/
+docs/
+download/
+downloads/
+files/
+images/
+img/
+includes/
+install/
+js/
+lib/
+log/
+logs/
+media/
+old/
+private/
+public/
+scripts/
+secret/
+src/
+static/
+storage/
+temp/
+test/
+tests/
+tmp/
+uploads/
+vendor/
+.aws/
+.git/
+.github/
+.ssh/
+.svn/
+.vscode/
+.well-known/
+
+# --- common config / environment files ---
+.env
+.env.bak
+.env.example
+.env.local
+.env.production
+.htaccess
+.htpasswd
+config.json
+config.php
+config.php.bak
+config.yml
+config.yaml
+settings.py
+settings.json
+web.config
+appsettings.json
+docker-compose.yml
+Dockerfile
+Makefile
+.dockerignore
+
+# --- version-control / metadata exposure ---
+.git/config
+.git/HEAD
+.gitignore
+.svn/entries
+
+# --- backup / archive files ---
+backup.zip
+backup.tar.gz
+backup.sql
+database.sql
+db.sql
+dump.sql
+site.zip
+www.zip
+old.zip
+
+# --- common application files ---
+index.php
+index.html
+index.html.bak
+robots.txt
+sitemap.xml
+crossdomain.xml
+humans.txt
+favicon.ico
+phpinfo.php
+info.php
+test.php
+server-status
+server-info
+status
+health
+healthz
+version
+version.json
+composer.json
+composer.lock
+package.json
+package-lock.json
+yarn.lock
+README.md
+CHANGELOG.md
+LICENSE
+
+# --- logs / debug output ---
+error_log
+error.log
+debug.log
+access.log
+laravel.log

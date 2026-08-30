@@ -1,0 +1,67 @@
+# reconhound/wordlists/api_endpoints.txt
+#
+# API sub-path segments consumed by reconhound/endpoint_discovery.py's API
+# endpoint discovery (context.md §10 module 10, responsibility 5). Each
+# entry is joined under every canonical API root context.md names
+# explicitly (/api/, /api/v1/, /api/v2/, /graphql/), e.g. "users" becomes
+# /api/users, /api/v1/users, /api/v2/users.
+#
+# Blank lines and lines starting with "#" are ignored.
+
+status
+health
+ping
+version
+info
+docs
+doc
+documentation
+swagger
+swagger.json
+swagger.yaml
+openapi.json
+openapi.yaml
+api-docs
+redoc
+schema
+graphql
+graphiql
+users
+user
+me
+account
+accounts
+login
+logout
+register
+auth
+authenticate
+token
+refresh
+session
+sessions
+admin
+config
+settings
+search
+upload
+uploads
+files
+data
+export
+import
+webhook
+webhooks
+events
+notifications
+products
+orders
+items
+list
+metrics
+debug
+internal
+private
+v1
+v2
+v3

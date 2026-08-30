@@ -1,0 +1,42 @@
+# reconhound/wordlists/wordpress_paths.txt
+#
+# WordPress-specific paths consumed by reconhound/endpoint_discovery.py's
+# framework-specific enumeration (context.md §10 module 10, responsibility
+# 4), probed only when WordPress is the detected/supplied technology.
+#
+# Convention: entries ending in "/" are directory candidates (recursion
+# candidates on a non-404 hit); all others are file/leaf candidates.
+#
+# Blank lines and lines starting with "#" are ignored.
+
+wp-login.php
+wp-admin/
+wp-admin/admin-ajax.php
+wp-admin/admin.php
+wp-admin/install.php
+wp-content/
+wp-content/uploads/
+wp-content/plugins/
+wp-content/themes/
+wp-content/debug.log
+wp-includes/
+wp-json/
+wp-json/wp/v2/
+wp-json/wp/v2/users
+wp-json/wp/v2/posts
+wp-config.php
+wp-config.php.bak
+wp-config.php.orig
+wp-config.php.save
+wp-cron.php
+wp-mail.php
+wp-load.php
+wp-settings.php
+wp-signup.php
+wp-trackback.php
+xmlrpc.php
+readme.html
+license.txt
+wp-content/plugins/akismet/
+feed/
+comments/feed/

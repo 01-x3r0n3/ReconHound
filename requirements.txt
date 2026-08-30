@@ -3,3 +3,4 @@ python-whois>=0.9,<1
 cryptography>=42
 requests>=2.31,<3
 beautifulsoup4>=4.12,<5
+rich>=13,<15

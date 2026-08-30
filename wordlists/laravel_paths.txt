@@ -1,0 +1,50 @@
+# reconhound/wordlists/laravel_paths.txt
+#
+# Laravel-specific paths consumed by reconhound/endpoint_discovery.py's
+# framework-specific enumeration (context.md §10 module 10, responsibility
+# 4), probed only when Laravel is the detected/supplied technology.
+#
+# Convention: entries ending in "/" are directory candidates (recursion
+# candidates on a non-404 hit); all others are file/leaf candidates.
+#
+# Blank lines and lines starting with "#" are ignored.
+
+.env
+.env.example
+.env.backup
+.env.production
+artisan
+composer.json
+composer.lock
+server.php
+storage/
+storage/logs/
+storage/logs/laravel.log
+storage/framework/
+storage/framework/sessions/
+bootstrap/
+bootstrap/cache/
+vendor/
+vendor/composer/
+public/
+public/index.php
+public/.htaccess
+routes/
+routes/web.php
+routes/api.php
+config/
+config/app.php
+config/database.php
+database/
+database/migrations/
+resources/
+telescope/
+horizon/
+nova/
+_ignition/health-check
+_ignition/execute-solution
+api/user
+sanctum/csrf-cookie
+login
+register
+password/reset

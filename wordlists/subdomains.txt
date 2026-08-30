@@ -1,0 +1,210 @@
+# reconhound/wordlists/subdomains.txt
+#
+# Candidate vhost/subdomain label wordlist consumed by
+# reconhound/vhost_scanner.py (context.md §10 module 9, §11 folder
+# structure — this file was named but not yet present; adding it fills in
+# an already-approved architectural gap, not a new one).
+#
+# Convention read by vhost_scanner.py's load_wordlist():
+#   - each line is a bare label (no dots), combined with the caller's
+#     `target` domain to build a full candidate Host-header value, e.g.
+#     "admin" + "example.com" -> "admin.example.com"
+#   - blank lines and lines starting with "#" are ignored
+#   - duplicates are dropped, order is preserved
+
+# --- common/general ---
+www
+mail
+webmail
+autodiscover
+autoconfig
+ftp
+ns1
+ns2
+mx
+smtp
+smtp2
+pop
+imap
+relay
+
+# --- admin / management panels ---
+admin
+administrator
+portal
+dashboard
+console
+panel
+controlpanel
+manage
+management
+cpanel
+whm
+phpmyadmin
+adminer
+
+# --- environments ---
+dev
+development
+staging
+stage
+test
+testing
+qa
+uat
+uat2
+demo
+demo2
+beta
+beta2
+alpha
+preview
+sandbox
+playground
+lab
+labs
+poc
+
+# --- api / integration ---
+api
+api-dev
+api-staging
+apiv1
+apiv2
+graphql
+ws
+websocket
+gateway
+proxy
+
+# --- infra / ops ---
+internal
+intranet
+extranet
+vpn
+remote
+secure
+ssl
+edge
+origin
+cache
+lb
+loadbalancer
+cdn
+static
+assets
+media
+img
+images
+files
+upload
+uploads
+download
+downloads
+storage
+backup
+backups
+old
+legacy
+new
+
+# --- data / platform services ---
+db
+database
+mysql
+sql
+redis
+elastic
+elasticsearch
+kafka
+rabbitmq
+queue
+worker
+workers
+cron
+scheduler
+batch
+etl
+data
+analytics
+report
+reports
+bi
+warehouse
+dw
+dr
+failover
+
+# --- devops / observability ---
+jenkins
+gitlab
+git
+grafana
+kibana
+prometheus
+metrics
+monitor
+monitoring
+status
+
+# --- collaboration / docs ---
+jira
+confluence
+wiki
+docs
+documentation
+help
+support
+helpdesk
+servicedesk
+
+# --- identity / auth ---
+sso
+auth
+login
+oauth
+id
+identity
+accounts
+account
+owa
+exchange
+sharepoint
+citrix
+rdp
+
+# --- commerce / customer-facing ---
+shop
+store
+cart
+checkout
+billing
+payment
+payments
+blog
+news
+forum
+forums
+community
+chat
+mobile
+app
+apps
+m
+
+# --- org / misc ---
+corp
+corporate
+hr
+finance
+legal
+it
+client
+clients
+partner
+partners
+vendor
+vendors
+external
+public
+private

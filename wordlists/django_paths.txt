@@ -1,0 +1,38 @@
+# reconhound/wordlists/django_paths.txt
+#
+# Django-specific paths consumed by reconhound/endpoint_discovery.py's
+# framework-specific enumeration (context.md §10 module 10, responsibility
+# 4), probed only when Django is the detected/supplied technology.
+#
+# Convention: entries ending in "/" are directory candidates (recursion
+# candidates on a non-404 hit); all others are file/leaf candidates.
+#
+# Blank lines and lines starting with "#" are ignored.
+
+admin/
+admin/login/
+accounts/
+accounts/login/
+accounts/logout/
+accounts/register/
+accounts/password_reset/
+api/
+api/v1/
+static/
+static/admin/
+media/
+__debug__/
+graphql
+graphiql
+health/
+healthz
+robots.txt
+sitemap.xml
+.env
+settings.py
+manage.py
+requirements.txt
+swagger/
+redoc/
+api-auth/
+api-auth/login/
