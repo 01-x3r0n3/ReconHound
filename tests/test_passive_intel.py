@@ -842,14 +842,452 @@ class TestPersistHostIntel:
 
 class TestPersistNoDataFindings:
     def test_persists_negative_result_finding(self, tmp_path):
+        """An authoritative provider 'no record' is a real negative result."""
         store = pin.PendingAssetsStore(output_dir=str(tmp_path))
-        errors = pin.persist_no_data_findings([SAFE_IP], SAFE_TARGET, ["shodan", "censys"], store)
+        errors = pin.persist_no_data_findings(
+            [SAFE_IP], SAFE_TARGET, ["shodan", "censys"], store,
+            ip_source_statuses={SAFE_IP: {"shodan": "not_found", "censys": "not_found"}},
+        )
         assert errors == []
         records = store.all()
         assert len(records) == 1
         assert records[0]["type"] == "passive_intel_checked_no_data"
         assert records[0]["confidence"] == pin.CONFIDENCE_LOW
         assert "does not prove" in records[0]["metadata"]["note"]
+        assert records[0]["metadata"]["sources_confirming_absence"] == ["censys", "shodan"]
+
+    def test_without_per_source_detail_defaults_to_inconclusive(self, tmp_path):
+        """
+        A caller that cannot say WHY there was no record must not have that
+        turned into a confirmed absence. Unknown fails safe.
+        """
+        store = pin.PendingAssetsStore(output_dir=str(tmp_path))
+        pin.persist_no_data_findings([SAFE_IP], SAFE_TARGET, ["shodan", "censys"], store)
+        records = store.all()
+        assert records[0]["type"] == "passive_intel_check_inconclusive"
+        assert records[0]["value"]["outcome"] == "inconclusive"
+
+    def test_provider_failure_is_inconclusive_not_absent(self, tmp_path):
+        store = pin.PendingAssetsStore(output_dir=str(tmp_path))
+        pin.persist_no_data_findings(
+            [SAFE_IP], SAFE_TARGET, ["shodan"], store,
+            ip_source_statuses={SAFE_IP: {"shodan": "rate_limited"}},
+        )
+        rec = store.all()[0]
+        assert rec["type"] == "passive_intel_check_inconclusive"
+        assert rec["metadata"]["sources_unavailable"] == ["shodan"]
+        assert "NOT a negative result" in rec["metadata"]["note"]
+
+    def test_unparsable_response_is_inconclusive_not_absent(self, tmp_path):
+        """The provider HAD data; failing to parse it is not evidence of absence."""
+        store = pin.PendingAssetsStore(output_dir=str(tmp_path))
+        pin.persist_no_data_findings(
+            [SAFE_IP], SAFE_TARGET, ["shodan"], store,
+            ip_source_statuses={SAFE_IP: {"shodan": pin.CHECK_UNPARSABLE}},
+        )
+        rec = store.all()[0]
+        assert rec["type"] == "passive_intel_check_inconclusive"
+        assert rec["metadata"]["sources_unparsable"] == ["shodan"]
+
+    def test_one_authoritative_plus_one_failure_notes_the_gap(self, tmp_path):
+        store = pin.PendingAssetsStore(output_dir=str(tmp_path))
+        pin.persist_no_data_findings(
+            [SAFE_IP], SAFE_TARGET, ["shodan", "censys"], store,
+            ip_source_statuses={SAFE_IP: {"shodan": "not_found", "censys": "error"}},
+        )
+        rec = store.all()[0]
+        assert rec["type"] == "passive_intel_checked_no_data"
+        assert rec["metadata"]["sources_confirming_absence"] == ["shodan"]
+        assert rec["metadata"]["sources_unavailable"] == ["censys"]
+        assert any("did not answer" in e for e in rec["evidence"])
+
+    def test_authoritative_absence_alongside_unparsable_stays_inconclusive(self, tmp_path):
+        """One source having data we could not read outweighs another's silence."""
+        store = pin.PendingAssetsStore(output_dir=str(tmp_path))
+        pin.persist_no_data_findings(
+            [SAFE_IP], SAFE_TARGET, ["shodan", "censys"], store,
+            ip_source_statuses={SAFE_IP: {"shodan": "not_found",
+                                          "censys": pin.CHECK_UNPARSABLE}},
+        )
+        assert store.all()[0]["type"] == "passive_intel_check_inconclusive"
+
+
+class TestSearchPagination:
+    """
+    Pagination audit: truncation must be visible, bounded, and must never
+    discard pages already retrieved when a later page fails.
+    """
+
+    @staticmethod
+    def _shodan_page(n, total, size=pin.SHODAN_PAGE_SIZE):
+        return {"matches": [{"ip_str": f"198.51.100.{i}", "port": 80}
+                            for i in range(size)], "total": total}
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_default_is_a_single_request_and_flags_truncation(self, mock_get):
+        """Default max_pages=1 preserves the original one-request credit cost."""
+        mock_get.return_value = _fake_response(200, {"matches": [{"ip_str": SAFE_IP}], "total": 5000})
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key")
+        assert mock_get.call_count == 1
+        assert r["total"] == 5000 and r["retrieved"] == 1
+        assert r["truncated"] is True
+        assert r["pages_fetched"] == 1
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_complete_result_set_is_not_marked_truncated(self, mock_get):
+        mock_get.return_value = _fake_response(200, {"matches": [{"ip_str": SAFE_IP}], "total": 1})
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key")
+        assert r["truncated"] is False and r["retrieved"] == 1
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_shodan_follows_pages_up_to_the_bound(self, mock_get):
+        mock_get.side_effect = [
+            _fake_response(200, self._shodan_page(1, 250)),
+            _fake_response(200, self._shodan_page(2, 250)),
+            _fake_response(200, self._shodan_page(3, 250)),
+        ]
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key", max_pages=2)
+        assert mock_get.call_count == 2          # bounded, never runs away
+        assert r["pages_fetched"] == 2
+        assert r["retrieved"] == 2 * pin.SHODAN_PAGE_SIZE
+        assert r["truncated"] is True            # 250 > 200 retrieved
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_short_page_ends_pagination_early(self, mock_get):
+        mock_get.side_effect = [
+            _fake_response(200, self._shodan_page(1, 105)),
+            _fake_response(200, {"matches": [{"ip_str": SAFE_IP}], "total": 105}),
+            _fake_response(200, self._shodan_page(3, 105)),  # must never be requested
+        ]
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key", max_pages=5)
+        assert mock_get.call_count == 2
+        assert r["retrieved"] == pin.SHODAN_PAGE_SIZE + 1
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_failure_on_page_two_preserves_page_one(self, mock_get):
+        """A partial provider failure must not erase valid observations."""
+        mock_get.side_effect = [
+            _fake_response(200, self._shodan_page(1, 500)),
+            _fake_response(429),
+        ]
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key", max_pages=3)
+        assert r["status"] == "found"                     # not downgraded to an error
+        assert r["retrieved"] == pin.SHODAN_PAGE_SIZE     # page 1 kept in full
+        assert r["truncated"] is True
+        assert "page 2" in r["page_error"] and "429" in r["page_error"]
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_malformed_page_two_preserves_page_one(self, mock_get):
+        mock_get.side_effect = [
+            _fake_response(200, self._shodan_page(1, 500)),
+            _fake_response(200, {"matches": "not-a-list", "total": 500}),
+        ]
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key", max_pages=3)
+        assert r["retrieved"] == pin.SHODAN_PAGE_SIZE
+        assert r["page_error"] is not None
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_failure_on_page_one_is_still_a_hard_error(self, mock_get):
+        mock_get.return_value = _fake_response(402)
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key", max_pages=3)
+        assert r["status"] == "insufficient_credits"
+        assert r["retrieved"] == 0
+        assert mock_get.call_count == 1  # a permanent error is not retried
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_full_page_without_usable_total_is_not_claimed_complete(self, mock_get):
+        """
+        Shodan has no end-of-results cursor. When `total` is missing, a full
+        final page leaves completeness genuinely unknown — reporting
+        truncated=False there would assert that nothing was left behind, which
+        is the one claim this flag exists to prevent.
+        """
+        mock_get.return_value = _fake_response(
+            200, {"matches": [{"ip_str": SAFE_IP}] * pin.SHODAN_PAGE_SIZE})
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key")
+        assert r["retrieved"] == pin.SHODAN_PAGE_SIZE
+        assert r["truncated"] is True
+        assert "could not be determined" in r["page_error"]
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_full_page_with_non_integer_total_is_not_claimed_complete(self, mock_get):
+        """Schema drift ('total' as a string) must not become a completeness claim."""
+        mock_get.return_value = _fake_response(
+            200, {"matches": [{"ip_str": SAFE_IP}] * pin.SHODAN_PAGE_SIZE, "total": "5000"})
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key")
+        assert r["truncated"] is True
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_short_page_without_total_is_still_treated_as_exhausted(self, mock_get):
+        """A short page IS an exhaustion signal; this must not over-trigger."""
+        mock_get.return_value = _fake_response(200, {"matches": [{"ip_str": SAFE_IP}] * 3})
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key")
+        assert r["truncated"] is False
+        assert r["page_error"] is None
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_full_page_with_matching_total_is_complete(self, mock_get):
+        """When Shodan does report a total, the provider signal governs."""
+        mock_get.return_value = _fake_response(
+            200, {"matches": [{"ip_str": SAFE_IP}] * pin.SHODAN_PAGE_SIZE,
+                  "total": pin.SHODAN_PAGE_SIZE})
+        r = pin.search_shodan_by_hostname(SAFE_TARGET, "key")
+        assert r["truncated"] is False
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_censys_full_page_without_next_cursor_is_complete(self, mock_get):
+        """Censys DOES have an authoritative end signal: absence of links.next."""
+        mock_get.return_value = _fake_response(
+            200, {"result": {"hits": [{"ip": SAFE_IP}] * 50, "links": {}}})
+        r = pin.search_censys_by_hostname(SAFE_TARGET, "id", "secret")
+        assert r["truncated"] is False
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_censys_follows_the_next_cursor(self, mock_get):
+        mock_get.side_effect = [
+            _fake_response(200, {"result": {"hits": [{"ip": SAFE_IP}], "total": 2,
+                                             "links": {"next": "cursor-2"}}}),
+            _fake_response(200, {"result": {"hits": [{"ip": SAFE_IP_2}], "total": 2,
+                                             "links": {"next": None}}}),
+        ]
+        r = pin.search_censys_by_hostname(SAFE_TARGET, "id", "secret", max_pages=3)
+        assert r["retrieved"] == 2 and r["pages_fetched"] == 2
+        assert r["truncated"] is False
+        assert mock_get.call_args_list[1].kwargs["params"]["cursor"] == "cursor-2"
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_censys_stops_when_page_budget_runs_out_with_cursor_left(self, mock_get):
+        mock_get.return_value = _fake_response(
+            200, {"result": {"hits": [{"ip": SAFE_IP}], "links": {"next": "more"}}})
+        r = pin.search_censys_by_hostname(SAFE_TARGET, "id", "secret", max_pages=1)
+        assert r["truncated"] is True
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_censys_repeated_cursor_does_not_loop_or_duplicate(self, mock_get):
+        """A provider echoing one cursor must not replay pages indefinitely."""
+        mock_get.return_value = _fake_response(
+            200, {"result": {"hits": [{"ip": SAFE_IP}], "total": 99,
+                             "links": {"next": "SAME"}}})
+        r = pin.search_censys_by_hostname(SAFE_TARGET, "id", "secret", max_pages=50)
+        assert mock_get.call_count == 2   # bounded by the repeat guard, not max_pages
+        assert "repeated" in r["page_error"]
+        assert r["truncated"] is True
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_run_summary_exposes_truncation(self, mock_get, tmp_path):
+        mock_get.return_value = _fake_response(
+            200, {"matches": [SHODAN_SEARCH_MATCH], "total": 9000})
+        result = pin.run_passive_intel(
+            SAFE_TARGET, output_dir=str(tmp_path), seed_ips=[], shodan_api_key="key",
+            censys_api_id=None, censys_api_secret=None,
+        )
+        search = result["source_status"]["shodan_hostname_search"]
+        assert search["total"] == 9000
+        assert search["retrieved"] == 1
+        assert search["truncated"] is True   # the 9000-vs-1 gap is now explicit
+
+
+class TestRunLevelCheckSemantics:
+    """A provider outage must never be recorded as 'checked and not found'."""
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_rate_limited_run_records_inconclusive_not_absence(self, mock_get, tmp_path):
+        mock_get.return_value = _fake_response(429)
+        result = pin.run_passive_intel(
+            SAFE_TARGET, output_dir=str(tmp_path), seed_ips=[SAFE_IP],
+            include_hostname_search=False, shodan_api_key="key",
+        )
+        assert result["stats"]["hosts_checked_no_data"] == 0
+        assert result["stats"]["hosts_check_inconclusive"] == 1
+        types = [r["type"] for r in pin.PendingAssetsStore(output_dir=str(tmp_path)).all()]
+        assert "passive_intel_check_inconclusive" in types
+        assert "passive_intel_checked_no_data" not in types
+        assert result["ip_check_outcomes"][SAFE_IP]["outcome"] == "inconclusive"
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_authoritative_404_still_records_a_negative_result(self, mock_get, tmp_path):
+        mock_get.return_value = _fake_response(404)
+        result = pin.run_passive_intel(
+            SAFE_TARGET, output_dir=str(tmp_path), seed_ips=[SAFE_IP],
+            include_hostname_search=False, shodan_api_key="key",
+        )
+        assert result["stats"]["hosts_checked_no_data"] == 1
+        assert result["stats"]["hosts_check_inconclusive"] == 0
+        types = [r["type"] for r in pin.PendingAssetsStore(output_dir=str(tmp_path)).all()]
+        assert "passive_intel_checked_no_data" in types
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_unparsable_provider_record_is_not_reported_as_absence(self, mock_get, tmp_path):
+        """The provider HAD a record; failing to parse it is not evidence of absence."""
+        mock_get.return_value = _fake_response(
+            200, {"ip_str": "not-an-ip", "ports": [443], "data": [{"port": 443}]})
+        result = pin.run_passive_intel(
+            SAFE_TARGET, output_dir=str(tmp_path), seed_ips=[SAFE_IP],
+            include_hostname_search=False, shodan_api_key="key",
+        )
+        assert result["stats"]["hosts_checked_no_data"] == 0
+        assert result["stats"]["hosts_check_inconclusive"] == 1
+        # The discarded record is reported, never silently dropped.
+        assert any(e["stage"] == "normalize_shodan_host" for e in result["errors"])
+        rec = [r for r in pin.PendingAssetsStore(output_dir=str(tmp_path)).all()
+               if r["type"] == "passive_intel_check_inconclusive"][0]
+        assert rec["metadata"]["sources_unparsable"] == ["shodan"]
+
+    @mock.patch("reconhound.passive_intel.requests.get")
+    def test_one_source_authoritative_other_down_notes_the_gap(self, mock_get, tmp_path):
+        def side_effect(url, **kwargs):
+            if url.startswith(pin.SHODAN_HOST_API_BASE):
+                return _fake_response(404)
+            raise requests.exceptions.Timeout()
+        mock_get.side_effect = side_effect
+        result = pin.run_passive_intel(
+            SAFE_TARGET, output_dir=str(tmp_path), seed_ips=[SAFE_IP],
+            include_hostname_search=False, shodan_api_key="key",
+            censys_api_id="id", censys_api_secret="secret",
+        )
+        assert result["stats"]["hosts_checked_no_data"] == 1
+        outcome = result["ip_check_outcomes"][SAFE_IP]
+        assert outcome["confirming"] == ["shodan"]
+        assert outcome["unavailable"] == ["censys"]
+        rec = [r for r in pin.PendingAssetsStore(output_dir=str(tmp_path)).all()
+               if r["type"] == "passive_intel_checked_no_data"][0]
+        assert any("silence proves nothing" in e for e in rec["evidence"])
+
+
+class TestAttribution:
+    """
+    Shodan's `hostname:` filter is a substring match, so a search for
+    example.com can return notexample.com. Discovery path alone must never
+    stand in for an ownership claim.
+    """
+
+    def test_hostname_search_without_in_scope_hostname_is_not_in_scope(self):
+        match = {"ip_str": SAFE_IP_2, "hostnames": ["www.notexample.com"],
+                 "domains": ["notexample.com"], "port": 443}
+        norm = pin.normalize_shodan_search_match(match, SAFE_TARGET)
+        norm["discovered_via"] = "hostname_search"
+        rec = pin.merge_host_records([norm], SAFE_TARGET)[0]
+        assert rec["in_scope"] is False
+        assert rec["attribution"]["basis"] == "provider_hostname_match_only"
+        assert rec["attribution"]["dns_attested"] is False
+        # The evidence is preserved in full — only the claim is withdrawn.
+        assert rec["hostnames"] == ["notexample.com", "www.notexample.com"]
+        assert rec["out_of_scope_hostnames"] == ["notexample.com", "www.notexample.com"]
+
+    def test_hostname_search_with_in_scope_hostname_is_in_scope(self):
+        match = {"ip_str": SAFE_IP_2, "hostnames": ["ssh.example.com"], "port": 22}
+        norm = pin.normalize_shodan_search_match(match, SAFE_TARGET)
+        norm["discovered_via"] = "hostname_search"
+        rec = pin.merge_host_records([norm], SAFE_TARGET)[0]
+        assert rec["in_scope"] is True
+        assert rec["attribution"]["basis"] == "in_scope_hostname_on_record"
+
+    def test_seed_ip_lookup_remains_dns_attested(self):
+        norm = pin.normalize_shodan_host({"ip_str": SAFE_IP, "data": []}, SAFE_TARGET)
+        norm["discovered_via"] = "seed_ip_lookup"
+        rec = pin.merge_host_records([norm], SAFE_TARGET)[0]
+        assert rec["in_scope"] is True
+        assert rec["attribution"]["basis"] == "dns_resolved_seed_ip"
+        assert rec["attribution"]["dns_attested"] is True
+
+    def test_shared_infrastructure_counts_are_reported_raw(self):
+        raw = {"ip_str": SAFE_IP, "hostnames": ["www.example.com", "a.other.com", "b.other.com"],
+               "data": []}
+        norm = pin.normalize_shodan_host(raw, SAFE_TARGET)
+        norm["discovered_via"] = "seed_ip_lookup"
+        rec = pin.merge_host_records([norm], SAFE_TARGET)[0]
+        attr = rec["attribution"]
+        assert attr["in_scope_hostname_count"] == 1
+        assert attr["out_of_scope_hostname_count"] == 2
+        assert rec["in_scope"] is True  # DNS still attests the IP itself
+
+    def test_multi_source_does_not_raise_confidence_for_unattributed_host(self):
+        """Corroborating an observation about someone else's host does not
+        make it more likely to be the target's."""
+        base = {"ip": SAFE_IP_2, "hostnames": ["www.notexample.com"], "ports": [],
+                "services": [], "certificates": [], "discovered_via": "hostname_search"}
+        recs = [dict(base, source="shodan"), dict(base, source="censys")]
+        rec = pin.merge_host_records(recs, SAFE_TARGET)[0]
+        assert set(rec["sources"]) == {"shodan", "censys"}
+        assert rec["in_scope"] is False
+        assert rec["confidence"] == pin.CONFIDENCE_MEDIUM
+
+    def test_multi_source_still_raises_confidence_for_attributed_host(self):
+        base = {"ip": SAFE_IP, "hostnames": ["www.example.com"], "ports": [],
+                "services": [], "certificates": [], "discovered_via": "seed_ip_lookup"}
+        recs = [dict(base, source="shodan"), dict(base, source="censys")]
+        rec = pin.merge_host_records(recs, SAFE_TARGET)[0]
+        assert rec["confidence"] == pin.CONFIDENCE_HIGH
+
+    def test_unattributed_host_evidence_says_so(self, tmp_path):
+        store = pin.PendingAssetsStore(output_dir=str(tmp_path))
+        match = {"ip_str": SAFE_IP_2, "hostnames": ["www.notexample.com"], "port": 443}
+        norm = pin.normalize_shodan_search_match(match, SAFE_TARGET)
+        norm["discovered_via"] = "hostname_search"
+        merged = pin.merge_host_records([norm], SAFE_TARGET)
+        pin.persist_host_intel(merged, SAFE_TARGET, store)
+        rec = [r for r in store.all() if r["type"] == "passive_intel_host"][0]
+        assert rec["metadata"]["attribution_basis"] == "provider_hostname_match_only"
+        assert any("Not attributed to" in e for e in rec["evidence"])
+        assert any("shared/CDN/multi-tenant" in e for e in rec["evidence"])
+
+
+class TestCertificateProvenance:
+    def test_shodan_certificate_carries_observation_time(self):
+        raw = {"ip_str": SAFE_IP, "data": [{
+            "port": 443, "timestamp": "2019-03-03T00:00:00.000000",
+            "ssl": {"cert": {"subject": {"CN": "old.example.com"}, "expired": True,
+                             "fingerprint": {"sha256": "ab"}}}}]}
+        cert = pin.normalize_shodan_host(raw, SAFE_TARGET)["certificates"][0]
+        # Without this a historical certificate is indistinguishable from a current one.
+        assert cert["observed_at"] == "2019-03-03T00:00:00.000000"
+        # The expiry verdict is preserved but attributed to the provider's scan time.
+        assert cert["expired"] is True
+        assert cert["expired_evaluated_by"] == "shodan_at_observation_time"
+
+    def test_censys_certificate_carries_observation_time(self):
+        raw = {"ip": SAFE_IP, "services": [{
+            "port": 443, "observed_at": "2021-07-07T00:00:00Z",
+            "certificate": {"fingerprint_sha256": "cd"}}]}
+        cert = pin.normalize_censys_host(raw, SAFE_TARGET)["certificates"][0]
+        assert cert["observed_at"] == "2021-07-07T00:00:00Z"
+
+    def test_censys_fingerprint_only_certificate_carries_observation_time(self):
+        raw = {"ip": SAFE_IP, "services": [{
+            "port": 443, "observed_at": "2021-07-07T00:00:00Z", "certificate": "abc123"}]}
+        cert = pin.normalize_censys_host(raw, SAFE_TARGET)["certificates"][0]
+        assert cert["observed_at"] == "2021-07-07T00:00:00Z"
+        assert cert["fingerprint_sha256"] == "abc123"
+
+
+class TestNegativeResultNamingContract:
+    def test_inconclusive_type_must_not_register_as_negative_result_memory(self):
+        """
+        surface_mapper._is_negative_result() keys negative-result memory off
+        the substring "_checked_no", and other modules trust that memory to
+        skip re-checking. An inconclusive check must never enter it, so the
+        finding type must never contain that substring.
+        """
+        assert "_checked_no" not in "passive_intel_check_inconclusive"
+        assert "_checked_no" in "passive_intel_checked_no_data"
+
+
+class TestClassifyIpCheck:
+    def test_authoritative_absence(self):
+        v = pin.classify_ip_check({"shodan": "not_found"})
+        assert v["outcome"] == "not_found" and v["confirming"] == ["shodan"]
+
+    @pytest.mark.parametrize("status", [
+        "error", "rate_limited", "unauthorized", "forbidden",
+        "insufficient_credits", "missing_credentials",
+    ])
+    def test_every_provider_failure_is_inconclusive(self, status):
+        v = pin.classify_ip_check({"shodan": status})
+        assert v["outcome"] == "inconclusive"
+        assert v["unavailable"] == ["shodan"]
+
+    def test_no_statuses_at_all_is_inconclusive(self):
+        assert pin.classify_ip_check({})["outcome"] == "inconclusive"
 
 
 # ---------------------------------------------------------------------------

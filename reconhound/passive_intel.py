@@ -186,6 +186,10 @@ SHODAN_API_KEY_ENV = "SHODAN_API_KEY"
 CENSYS_API_ID_ENV = "CENSYS_API_ID"
 CENSYS_API_SECRET_ENV = "CENSYS_API_SECRET"
 
+# Shodan returns at most 100 matches per search page and bills one query
+# credit per page requested.
+SHODAN_PAGE_SIZE = 100
+
 SHODAN_HOST_API_BASE = "https://api.shodan.io/shodan/host"
 SHODAN_SEARCH_API_BASE = "https://api.shodan.io/shodan/host/search"
 CENSYS_HOST_API_BASE = "https://search.censys.io/api/v2/hosts"
@@ -197,6 +201,30 @@ CENSYS_SEARCH_API_BASE = "https://search.censys.io/api/v2/hosts/search"
 # surface_mapper.py exists (module docstring, input-contract decision #1).
 _SEED_HOST_FINDING_TYPE = "dns_record"
 _SEED_HOST_RECORD_TYPES = ("A", "AAAA")
+
+# ---------------------------------------------------------------------------
+# Per-IP check outcomes (context.md §8 negative-result memory)
+#
+# Only an authoritative provider answer ("we have no record for this IP",
+# HTTP 404) is a negative RESULT. A refused, throttled, unpaid, or timed-out
+# request produced no answer at all, and a record we received but could not
+# parse is evidence that data EXISTS. Collapsing any of those into "checked
+# and not found" writes a false negative into negative-result memory, which
+# other modules then trust to skip re-checking.
+# ---------------------------------------------------------------------------
+
+# Provider statuses that constitute an authoritative "no record for this IP".
+_AUTHORITATIVE_ABSENT_STATUSES = frozenset({"not_found"})
+
+# Provider statuses meaning "no answer was obtained" — never a negative result.
+_PROVIDER_UNAVAILABLE_STATUSES = frozenset({
+    "error", "rate_limited", "unauthorized", "forbidden",
+    "insufficient_credits", "missing_credentials",
+})
+
+# The provider returned a record, but this module could not normalize it.
+# Evidence that data exists, so the opposite of an absence result.
+CHECK_UNPARSABLE = "unparsable_response"
 
 
 class ScopeError(ValueError):
@@ -512,6 +540,7 @@ def search_shodan_by_hostname(
     timeout: float = DEFAULT_TIMEOUT,
     base_url: str = SHODAN_SEARCH_API_BASE,
     extra_query: Optional[str] = None,
+    max_pages: int = 1,
 ) -> Dict[str, Any]:
     """
     Search Shodan for hosts it has indexed under `hostname` via
@@ -520,11 +549,28 @@ def search_shodan_by_hostname(
     Shodan search consumes query credits; a 402 is reported distinctly as
     "insufficient_credits" rather than a generic error.
 
+    PAGINATION: Shodan returns 100 matches per page and reports the full
+    result count in `total`. `max_pages` defaults to 1, which preserves this
+    module's original single-request behaviour and its exact query-credit
+    cost (Shodan bills one credit per page); raise it deliberately to fetch
+    more. `truncated` says whether results were left behind, so a caller can
+    never mistake a first page for the complete result set. If a later page
+    fails, every match already retrieved is kept and the failure is reported
+    in `page_error` rather than discarding good data.
+
     Returns {"status": "found"|"not_found"|"missing_credentials"|
              "unauthorized"|"insufficient_credits"|"rate_limited"|"error",
-             "matches": [...], "total": int, "error": str|None}.
+             "matches": [...], "total": int, "retrieved": int,
+             "truncated": bool, "pages_fetched": int,
+             "page_error": str|None, "error": str|None}.
+
+    NOTE: `total` is the provider's count for the whole result set; use
+    `retrieved` for how many records this call actually returned.
     """
-    result: Dict[str, Any] = {"status": "error", "matches": [], "total": 0, "error": None}
+    result: Dict[str, Any] = {
+        "status": "error", "matches": [], "total": 0, "retrieved": 0,
+        "truncated": False, "pages_fetched": 0, "page_error": None, "error": None,
+    }
 
     if not hostname or not hostname.strip():
         result["error"] = "hostname is required"
@@ -539,65 +585,137 @@ def search_shodan_by_hostname(
     if extra_query:
         query = f"{query} {extra_query}"
 
+    matches: List[Any] = []
+    provider_total: Optional[int] = None
+    # Shodan has no end-of-results cursor, so a full final page is the only
+    # completeness hint available when `total` is missing or not an integer.
+    last_page_was_full = False
+    page_limit = max(1, int(max_pages))
+
+    for page in range(1, page_limit + 1):
+        params: Dict[str, Any] = {"key": api_key, "query": query}
+        if page > 1:
+            params["page"] = page
+
+        page_result = _shodan_search_page(base_url, params, timeout)
+
+        if page_result["error_status"] is not None:
+            if page == 1:
+                result["status"] = page_result["error_status"]
+                result["error"] = page_result["error"]
+                return result
+            # A later page failed. Everything already retrieved is real data
+            # and is kept; only the completeness claim changes.
+            result["page_error"] = f"page {page}: {page_result['error']}"
+            result["truncated"] = True
+            break
+
+        page_matches = page_result["matches"]
+        if provider_total is None:
+            provider_total = page_result["total"]
+        matches.extend(page_matches)
+        result["pages_fetched"] = page
+        last_page_was_full = len(page_matches) >= SHODAN_PAGE_SIZE
+
+        if not page_matches or len(page_matches) < SHODAN_PAGE_SIZE:
+            break  # short page means the result set is exhausted
+
+    result["matches"] = matches
+    result["retrieved"] = len(matches)
+    total_known = isinstance(provider_total, int)
+    result["total"] = provider_total if total_known else len(matches)
+
+    if total_known:
+        # Shodan reported the size of the whole result set: it governs.
+        if result["total"] > len(matches):
+            result["truncated"] = True
+    elif last_page_was_full:
+        # No usable `total`, and the last page came back full. Completeness is
+        # unknown, and `truncated=False` would assert that nothing was left
+        # behind — the exact claim this flag exists to prevent a caller from
+        # making. A short final page is still treated as exhaustion, so this
+        # never fires merely because a page size was reached mid-stream.
+        result["truncated"] = True
+        if result["page_error"] is None:
+            result["page_error"] = (
+                "Shodan returned no usable 'total'; the final page was full, so "
+                "whether more results exist could not be determined"
+            )
+    result["status"] = "found" if matches else "not_found"
+    return result
+
+
+def _shodan_search_page(base_url: str, params: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+    """
+    Fetch and validate one Shodan search page.
+
+    Returns {"matches": [...], "total": int|None, "error_status": str|None,
+    "error": str|None}. `error_status` is None on success; otherwise it is the
+    status the caller should surface for a first-page failure.
+    """
+    out: Dict[str, Any] = {"matches": [], "total": None, "error_status": None, "error": None}
+
     resp = None
     try:
         resp = requests.get(
-            base_url,
-            params={"key": api_key, "query": query},
-            timeout=timeout,
+            base_url, params=params, timeout=timeout,
             headers={"User-Agent": DEFAULT_USER_AGENT},
         )
     except requests.exceptions.Timeout:
-        result["error"] = "timeout"
-        return result
+        out["error_status"], out["error"] = "error", "timeout"
+        return out
     except requests.exceptions.ConnectionError as exc:
-        result["error"] = f"connection error: {exc}"
-        return result
+        out["error_status"], out["error"] = "error", f"connection error: {exc}"
+        return out
     except requests.exceptions.RequestException as exc:
-        result["error"] = f"request failed: {exc}"
-        return result
+        out["error_status"], out["error"] = "error", f"request failed: {exc}"
+        return out
     finally:
         if resp is not None:
             resp.close()
 
     if resp.status_code == 401:
-        result["status"] = "unauthorized"
-        result["error"] = "Shodan API rejected the configured API key (HTTP 401)"
-        return result
+        out["error_status"] = "unauthorized"
+        out["error"] = "Shodan API rejected the configured API key (HTTP 401)"
+        return out
     if resp.status_code == 402:
-        result["status"] = "insufficient_credits"
-        result["error"] = "Shodan search requires query credits (HTTP 402 Payment Required)"
-        return result
+        out["error_status"] = "insufficient_credits"
+        out["error"] = "Shodan search requires query credits (HTTP 402 Payment Required)"
+        return out
     if resp.status_code == 429:
-        result["status"] = "rate_limited"
-        result["error"] = "HTTP 429 Too Many Requests from Shodan API"
-        return result
+        out["error_status"] = "rate_limited"
+        out["error"] = "HTTP 429 Too Many Requests from Shodan API"
+        return out
     if resp.status_code >= 500:
-        result["error"] = f"Shodan API returned HTTP {resp.status_code}"
-        return result
+        out["error_status"] = "error"
+        out["error"] = f"Shodan API returned HTTP {resp.status_code}"
+        return out
     if resp.status_code != 200:
-        result["error"] = f"Shodan API returned unexpected HTTP {resp.status_code}"
-        return result
+        out["error_status"] = "error"
+        out["error"] = f"Shodan API returned unexpected HTTP {resp.status_code}"
+        return out
 
     try:
         data = resp.json()
     except ValueError as exc:
-        result["error"] = f"malformed JSON from Shodan API: {exc}"
-        return result
+        out["error_status"] = "error"
+        out["error"] = f"malformed JSON from Shodan API: {exc}"
+        return out
 
     if not isinstance(data, dict) or "matches" not in data:
-        result["error"] = "unexpected Shodan search API response structure"
-        return result
+        out["error_status"] = "error"
+        out["error"] = "unexpected Shodan search API response structure"
+        return out
 
-    matches = data.get("matches")
-    if not isinstance(matches, list):
-        result["error"] = "unexpected Shodan search API response structure (matches is not a list)"
-        return result
+    page_matches = data.get("matches")
+    if not isinstance(page_matches, list):
+        out["error_status"] = "error"
+        out["error"] = "unexpected Shodan search API response structure (matches is not a list)"
+        return out
 
-    result["matches"] = matches
-    result["total"] = data.get("total") if isinstance(data.get("total"), int) else len(matches)
-    result["status"] = "found" if matches else "not_found"
-    return result
+    out["matches"] = page_matches
+    out["total"] = data.get("total") if isinstance(data.get("total"), int) else None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -706,17 +824,33 @@ def search_censys_by_hostname(
     base_url: str = CENSYS_SEARCH_API_BASE,
     query: Optional[str] = None,
     per_page: int = 50,
+    max_pages: int = 1,
 ) -> Dict[str, Any]:
     """
     Search Censys for hosts it has indexed under `hostname` via
     GET /api/v2/hosts/search?q=dns.names:<hostname>, scoped exactly to the
     target hostname (module docstring, input-contract decision #2).
 
+    PAGINATION: Censys v2 pages via an opaque cursor at
+    `result.links.next`. `max_pages` defaults to 1, preserving this module's
+    original single-request behaviour and per-run quota cost; raise it
+    deliberately to follow the cursor further. `truncated` reports whether
+    more results remained. A failure on a later page keeps every hit already
+    retrieved and is reported via `page_error` instead of discarding it.
+
     Returns {"status": "found"|"not_found"|"missing_credentials"|
              "unauthorized"|"forbidden"|"rate_limited"|"error",
-             "hits": [...], "total": int, "error": str|None}.
+             "hits": [...], "total": int, "retrieved": int,
+             "truncated": bool, "pages_fetched": int,
+             "page_error": str|None, "error": str|None}.
+
+    NOTE: `total` is Censys's count for the whole result set; use `retrieved`
+    for how many records this call actually returned.
     """
-    result: Dict[str, Any] = {"status": "error", "hits": [], "total": 0, "error": None}
+    result: Dict[str, Any] = {
+        "status": "error", "hits": [], "total": 0, "retrieved": 0,
+        "truncated": False, "pages_fetched": 0, "page_error": None, "error": None,
+    }
 
     if not hostname or not hostname.strip():
         result["error"] = "hostname is required"
@@ -731,69 +865,142 @@ def search_censys_by_hostname(
         return result
 
     resolved_query = query or f"dns.names: {hostname.strip()}"
+    resolved_per_page = max(1, min(per_page, 100))
+
+    hits: List[Any] = []
+    provider_total: Optional[int] = None
+    cursor: Optional[str] = None
+    # Guards against a provider that returns the same cursor repeatedly, which
+    # would otherwise replay one page into duplicate observations and inflate
+    # every downstream service/certificate count.
+    seen_cursors: Set[str] = set()
+    page_limit = max(1, int(max_pages))
+
+    for page in range(1, page_limit + 1):
+        params: Dict[str, Any] = {"q": resolved_query, "per_page": resolved_per_page}
+        if cursor:
+            params["cursor"] = cursor
+
+        page_result = _censys_search_page(base_url, params, (api_id, api_secret), timeout)
+
+        if page_result["error_status"] is not None:
+            if page == 1:
+                result["status"] = page_result["error_status"]
+                result["error"] = page_result["error"]
+                return result
+            result["page_error"] = f"page {page}: {page_result['error']}"
+            result["truncated"] = True
+            break
+
+        if provider_total is None:
+            provider_total = page_result["total"]
+        hits.extend(page_result["hits"])
+        result["pages_fetched"] = page
+
+        cursor = page_result["next_cursor"]
+        if not cursor:
+            break  # no further cursor means the result set is exhausted
+        if cursor in seen_cursors:
+            result["page_error"] = (
+                f"page {page}: Censys repeated a previously seen pagination cursor; "
+                f"stopped to avoid duplicating results"
+            )
+            result["truncated"] = True
+            cursor = None
+            break
+        seen_cursors.add(cursor)
+    else:
+        # Ran out of allowed pages while Censys still offered a next cursor.
+        if cursor:
+            result["truncated"] = True
+
+    result["hits"] = hits
+    result["retrieved"] = len(hits)
+    result["total"] = provider_total if isinstance(provider_total, int) else len(hits)
+    if result["total"] > len(hits):
+        result["truncated"] = True
+    result["status"] = "found" if hits else "not_found"
+    return result
+
+
+def _censys_search_page(base_url: str, params: Dict[str, Any], auth, timeout: float) -> Dict[str, Any]:
+    """
+    Fetch and validate one Censys search page.
+
+    Returns {"hits": [...], "total": int|None, "next_cursor": str|None,
+    "error_status": str|None, "error": str|None}.
+    """
+    out: Dict[str, Any] = {
+        "hits": [], "total": None, "next_cursor": None, "error_status": None, "error": None,
+    }
 
     resp = None
     try:
         resp = requests.get(
-            base_url,
-            params={"q": resolved_query, "per_page": max(1, min(per_page, 100))},
-            auth=(api_id, api_secret),
-            timeout=timeout,
+            base_url, params=params, auth=auth, timeout=timeout,
             headers={"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"},
         )
     except requests.exceptions.Timeout:
-        result["error"] = "timeout"
-        return result
+        out["error_status"], out["error"] = "error", "timeout"
+        return out
     except requests.exceptions.ConnectionError as exc:
-        result["error"] = f"connection error: {exc}"
-        return result
+        out["error_status"], out["error"] = "error", f"connection error: {exc}"
+        return out
     except requests.exceptions.RequestException as exc:
-        result["error"] = f"request failed: {exc}"
-        return result
+        out["error_status"], out["error"] = "error", f"request failed: {exc}"
+        return out
     finally:
         if resp is not None:
             resp.close()
 
     if resp.status_code == 401:
-        result["status"] = "unauthorized"
-        result["error"] = "Censys API rejected the configured credentials (HTTP 401)"
-        return result
+        out["error_status"] = "unauthorized"
+        out["error"] = "Censys API rejected the configured credentials (HTTP 401)"
+        return out
     if resp.status_code == 403:
-        result["status"] = "forbidden"
-        result["error"] = "Censys API returned HTTP 403 (quota exhausted or insufficient permissions)"
-        return result
+        out["error_status"] = "forbidden"
+        out["error"] = "Censys API returned HTTP 403 (quota exhausted or insufficient permissions)"
+        return out
     if resp.status_code == 429:
-        result["status"] = "rate_limited"
-        result["error"] = "HTTP 429 Too Many Requests from Censys API"
-        return result
+        out["error_status"] = "rate_limited"
+        out["error"] = "HTTP 429 Too Many Requests from Censys API"
+        return out
     if resp.status_code >= 500:
-        result["error"] = f"Censys API returned HTTP {resp.status_code}"
-        return result
+        out["error_status"] = "error"
+        out["error"] = f"Censys API returned HTTP {resp.status_code}"
+        return out
     if resp.status_code != 200:
-        result["error"] = f"Censys API returned unexpected HTTP {resp.status_code}"
-        return result
+        out["error_status"] = "error"
+        out["error"] = f"Censys API returned unexpected HTTP {resp.status_code}"
+        return out
 
     try:
         data = resp.json()
     except ValueError as exc:
-        result["error"] = f"malformed JSON from Censys API: {exc}"
-        return result
+        out["error_status"] = "error"
+        out["error"] = f"malformed JSON from Censys API: {exc}"
+        return out
 
     if not isinstance(data, dict):
-        result["error"] = "unexpected Censys search API response structure"
-        return result
+        out["error_status"] = "error"
+        out["error"] = "unexpected Censys search API response structure"
+        return out
 
     outer = data.get("result") if isinstance(data.get("result"), dict) else data
-    hits = outer.get("hits")
-    if not isinstance(hits, list):
-        result["error"] = "unexpected Censys search API response structure (hits is not a list)"
-        return result
+    page_hits = outer.get("hits")
+    if not isinstance(page_hits, list):
+        out["error_status"] = "error"
+        out["error"] = "unexpected Censys search API response structure (hits is not a list)"
+        return out
 
-    result["hits"] = hits
+    out["hits"] = page_hits
     total = outer.get("total")
-    result["total"] = total if isinstance(total, int) else len(hits)
-    result["status"] = "found" if hits else "not_found"
-    return result
+    out["total"] = total if isinstance(total, int) else None
+
+    links = outer.get("links") if isinstance(outer.get("links"), dict) else {}
+    next_cursor = links.get("next")
+    out["next_cursor"] = next_cursor if isinstance(next_cursor, str) and next_cursor else None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -819,7 +1026,15 @@ def extract_shodan_certificate(service_entry: Dict[str, Any], port: Any, source_
         "issuer_cn": issuer.get("CN"),
         "serial": cert.get("serial"),
         "expires": cert.get("expires"),
+        # Shodan's own expiry verdict AT THE TIME IT SCANNED, not now. Kept as
+        # provider-reported evidence alongside `observed_at` so downstream can
+        # re-evaluate against the current date rather than trusting a stale
+        # boolean (context.md §8: preserve the observation, not a conclusion).
         "expired": cert.get("expired"),
+        "expired_evaluated_by": "shodan_at_observation_time",
+        # When the provider observed this certificate. Without it a historical
+        # certificate is indistinguishable from a current one.
+        "observed_at": service_entry.get("timestamp"),
         "fingerprint_sha256": fingerprint.get("sha256"),
         "fingerprint_sha1": fingerprint.get("sha1"),
         "sig_alg": cert.get("sig_alg"),
@@ -953,6 +1168,7 @@ def extract_censys_certificate(service_entry: Dict[str, Any], source_ip: str) ->
             "fingerprint_sha256": cert.get("fingerprint_sha256") or cert.get("fingerprint"),
             "not_before": validity.get("not_before") or cert.get("not_before"),
             "not_after": validity.get("not_after") or cert.get("not_after"),
+            "observed_at": service_entry.get("observed_at"),
             "source": "censys",
             "source_ip": source_ip,
         }
@@ -966,6 +1182,7 @@ def extract_censys_certificate(service_entry: Dict[str, Any], source_ip: str) ->
             "fingerprint_sha256": cert,
             "not_before": None,
             "not_after": None,
+            "observed_at": service_entry.get("observed_at"),
             "note": (
                 "Censys returned only a certificate fingerprint reference; full "
                 "certificate detail was not expanded (out of this module's scope)."
@@ -1113,14 +1330,53 @@ def merge_host_records(records: List[Dict[str, Any]], target: str) -> List[Dict[
     results: List[Dict[str, Any]] = []
     for ip in order:
         m = merged[ip]
-        in_scope_hostnames = sorted(h for h in m["hostnames"] if is_in_scope(h, target))
-        in_scope = bool(in_scope_hostnames) or bool({"seed_ip_lookup", "hostname_search"} & m["discovered_via"])
+        all_hostnames = sorted(m["hostnames"])
+        in_scope_hostnames = sorted(h for h in all_hostnames if is_in_scope(h, target))
+        out_of_scope_hostnames = [h for h in all_hostnames if h not in set(in_scope_hostnames)]
+
+        # An IP is attributable to the target when the target's own DNS
+        # resolved to it, or when the provider record actually carries an
+        # in-scope hostname.
+        #
+        # Discovery via hostname search is NOT on its own sufficient: Shodan's
+        # `hostname:` filter is a substring match, so a search for
+        # "example.com" can return "notexample.com". Treating the search path
+        # itself as proof of scope marked every such host in-scope with zero
+        # in-scope hostnames — manufacturing an ownership claim from a
+        # provider's fuzzy match. The record is still kept in full; only the
+        # unsupported attribution claim is withdrawn.
+        dns_attested = "seed_ip_lookup" in m["discovered_via"]
+        in_scope = bool(in_scope_hostnames) or dns_attested
+
+        if dns_attested:
+            basis = "dns_resolved_seed_ip"
+        elif in_scope_hostnames:
+            basis = "in_scope_hostname_on_record"
+        else:
+            basis = "provider_hostname_match_only"
+
+        attribution = {
+            "basis": basis,
+            "dns_attested": dns_attested,
+            "hostname_count": len(all_hostnames),
+            "in_scope_hostname_count": len(in_scope_hostnames),
+            "out_of_scope_hostname_count": len(out_of_scope_hostnames),
+            "note": (
+                "External providers index infrastructure, not ownership. An IP "
+                "carrying hostnames for unrelated organizations is shared/CDN/"
+                "multi-tenant infrastructure; out_of_scope_hostname_count is "
+                "reported raw so downstream correlation decides attribution."
+            ),
+        }
+
         multi_source = len(m["sources"]) > 1
         results.append({
             "ip": m["ip"],
-            "hostnames": sorted(m["hostnames"]),
+            "hostnames": all_hostnames,
             "in_scope_hostnames": in_scope_hostnames,
+            "out_of_scope_hostnames": out_of_scope_hostnames,
             "in_scope": in_scope,
+            "attribution": attribution,
             "ports": sorted(m["ports"]),
             "services": m["services"],
             "certificates": m["certificates"],
@@ -1129,7 +1385,11 @@ def merge_host_records(records: List[Dict[str, Any]], target: str) -> List[Dict[
             "last_observed_at": m["last_observed_at"],
             "sources": sorted(m["sources"]),
             "discovered_via": sorted(m["discovered_via"]),
-            "confidence": CONFIDENCE_HIGH if multi_source else CONFIDENCE_MEDIUM,
+            # Two providers converging raises confidence in the OBSERVATION
+            # (context.md §8) — but only once the host is actually attributable
+            # to the target. Corroborating an observation about someone else's
+            # host does not make it more likely to be the target's.
+            "confidence": CONFIDENCE_HIGH if (multi_source and in_scope) else CONFIDENCE_MEDIUM,
         })
     return sorted(results, key=lambda r: r["ip"])
 
@@ -1144,6 +1404,19 @@ def persist_host_intel(merged_records: List[Dict[str, Any]], target: str, store:
             f"intelligence database): {len(rec['services'])} service(s) across "
             f"{len(rec['ports'])} port(s), last observed at {rec['last_observed_at']}"
         ]
+        attribution = rec.get("attribution") or {}
+        if attribution.get("basis") == "provider_hostname_match_only":
+            evidence.append(
+                f"Not attributed to {target}: the provider returned this host for a "
+                f"hostname search but the record carries no in-scope hostname, and "
+                f"{target}'s DNS does not resolve to this IP"
+            )
+        if attribution.get("out_of_scope_hostname_count"):
+            evidence.append(
+                f"Host also carries {attribution['out_of_scope_hostname_count']} hostname(s) "
+                f"outside {target} — possible shared/CDN/multi-tenant infrastructure, so "
+                f"services observed here are not necessarily the target's"
+            )
         err = _safe_store_add(store, make_finding(
             finding_type="passive_intel_host",
             target=target,
@@ -1155,6 +1428,9 @@ def persist_host_intel(merged_records: List[Dict[str, Any]], target: str, store:
                 "sources": rec["sources"],
                 "discovered_via": rec["discovered_via"],
                 "in_scope": rec["in_scope"],
+                "attribution_basis": rec.get("attribution", {}).get("basis"),
+                "out_of_scope_hostname_count": rec.get("attribution", {}).get(
+                    "out_of_scope_hostname_count", 0),
                 "port_count": len(rec["ports"]),
                 "service_count": len(rec["services"]),
                 "certificate_count": len(rec["certificates"]),
@@ -1197,30 +1473,128 @@ def persist_host_intel(merged_records: List[Dict[str, Any]], target: str, store:
     return errors
 
 
+def classify_ip_check(source_statuses: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Decide what a set of per-source lookup statuses for one IP actually proves.
+
+    `source_statuses` maps a source name ("shodan"/"censys") to the status that
+    source returned for this IP. Returns::
+
+        {"outcome": "not_found" | "inconclusive",
+         "confirming": [sources that authoritatively reported no record],
+         "unavailable": [sources that never answered],
+         "unparsable": [sources that answered with data we could not parse]}
+
+    "not_found" requires at least one source to have authoritatively answered.
+    Anything else is inconclusive: a throttled, unpaid, refused or timed-out
+    request is not evidence of absence, and a record we failed to parse is
+    evidence that data exists.
+    """
+    confirming = sorted(src for src, st in source_statuses.items()
+                        if st in _AUTHORITATIVE_ABSENT_STATUSES)
+    unavailable = sorted(src for src, st in source_statuses.items()
+                         if st in _PROVIDER_UNAVAILABLE_STATUSES)
+    unparsable = sorted(src for src, st in source_statuses.items() if st == CHECK_UNPARSABLE)
+    return {
+        "outcome": "not_found" if (confirming and not unparsable) else "inconclusive",
+        "confirming": confirming,
+        "unavailable": unavailable,
+        "unparsable": unparsable,
+    }
+
+
 def persist_no_data_findings(
     no_data_ips: List[str],
     target: str,
     sources_checked: List[str],
     store: Optional[PendingAssetsStore],
+    ip_source_statuses: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> List[str]:
-    """Persist a negative-result-memory finding for each seed IP checked against >=1 source with no resulting record."""
+    """
+    Persist negative-result memory for seed IPs that produced no host record.
+
+    Each IP is classified first (see classify_ip_check). Only IPs a provider
+    authoritatively reported as unknown get `passive_intel_checked_no_data`;
+    IPs whose lookups failed, were throttled, or returned unparsable data get
+    `passive_intel_check_inconclusive` instead, so nothing downstream reads a
+    provider outage as "checked and confirmed absent".
+
+    `ip_source_statuses` maps ip -> {source: status}. When omitted the caller
+    is treated as having no per-source detail and every IP is recorded as
+    inconclusive — the safe direction, never a fabricated absence.
+    """
     errors: List[str] = []
+    ip_source_statuses = ip_source_statuses or {}
+
     for ip in no_data_ips:
+        verdict = classify_ip_check(ip_source_statuses.get(ip, {}))
+        confirming = verdict["confirming"]
+        unavailable = verdict["unavailable"]
+        unparsable = verdict["unparsable"]
+
+        if verdict["outcome"] == "not_found":
+            evidence = [
+                f"No historical record found for {ip}; "
+                f"{', '.join(confirming)} authoritatively reported no data for this IP"
+            ]
+            if unavailable:
+                evidence.append(
+                    f"Not corroborated by {', '.join(unavailable)} — "
+                    f"that source did not answer, so its silence proves nothing"
+                )
+            finding_type = "passive_intel_checked_no_data"
+            note = (
+                "Negative-result-memory: absence of external intelligence does not "
+                "prove the host/service does not exist — Shodan/Censys only index "
+                "what their own scanners have already observed."
+            )
+        else:
+            reasons = []
+            if unavailable:
+                reasons.append(f"{', '.join(unavailable)} did not answer")
+            if unparsable:
+                reasons.append(
+                    f"{', '.join(unparsable)} returned a record this module could not parse"
+                )
+            if not reasons:
+                reasons.append("no source produced an authoritative answer")
+            evidence = [
+                f"Check of {ip} was INCONCLUSIVE, not negative: {'; '.join(reasons)}"
+            ]
+            # NAMING CONTRACT: surface_mapper._is_negative_result() treats any
+            # finding type containing "_checked_no" as negative-result memory,
+            # which other modules trust to skip re-checking. This type must
+            # therefore NEVER contain that substring — an inconclusive check is
+            # not a negative result and must not suppress a future re-check.
+            finding_type = "passive_intel_check_inconclusive"
+            note = (
+                "This is NOT a negative result. No provider authoritatively reported "
+                "the absence of a record for this IP, so this check must not be used "
+                "to skip re-checking or to conclude the host is unknown to the provider."
+            )
+
         err = _safe_store_add(store, make_finding(
-            finding_type="passive_intel_checked_no_data",
+            finding_type=finding_type,
             target=target,
-            value={"ip": ip, "sources_checked": sources_checked},
-            evidence=[f"No historical record found for {ip} across: {', '.join(sources_checked)}"],
+            value={
+                "ip": ip,
+                "sources_checked": sources_checked,
+                "outcome": verdict["outcome"],
+                "sources_confirming_absence": confirming,
+                "sources_unavailable": unavailable,
+                "sources_unparsable": unparsable,
+            },
+            evidence=evidence,
             confidence=CONFIDENCE_LOW,
             metadata={
                 "ip": ip,
                 "sources_checked": sources_checked,
+                "outcome": verdict["outcome"],
+                "sources_confirming_absence": confirming,
+                "sources_unavailable": unavailable,
+                "sources_unparsable": unparsable,
                 "checked_at": _now(),
-                "note": (
-                    "Negative-result-memory: absence of external intelligence does not "
-                    "prove the host/service does not exist — Shodan/Censys only index "
-                    "what their own scanners have already observed."
-                ),
+                "note": note,
             },
         ))
         if err:
@@ -1243,6 +1617,7 @@ def run_passive_intel(
     include_censys: bool = True,
     include_hostname_search: bool = True,
     timeout: float = DEFAULT_TIMEOUT,
+    max_search_pages: int = 1,
 ) -> Dict[str, Any]:
     """
     Run all Module 2 passive-intel checks against `target` and persist
@@ -1252,6 +1627,11 @@ def run_passive_intel(
     and clearly reported in `source_status` (module docstring, credential
     handling). Running with zero credentials configured completes
     successfully with an empty result set.
+
+    `max_search_pages` bounds hostname-search pagination (default 1, which
+    preserves the original single-request behaviour and provider quota cost).
+    Whenever results were left behind, `source_status[...]["truncated"]` says
+    so explicitly.
     """
     target = validate_target(target)
     store = PendingAssetsStore(output_dir=output_dir)
@@ -1299,6 +1679,12 @@ def run_passive_intel(
     ips_with_data: Set[str] = set()
     shodan_host_lookups: List[Dict[str, Any]] = []
     censys_host_lookups: List[Dict[str, Any]] = []
+    # ip -> {source: status}. Drives negative-result memory: only an
+    # authoritative provider answer may be recorded as "checked, not found".
+    ip_source_statuses: Dict[str, Dict[str, str]] = {}
+
+    def _record_status(ip_addr: str, source: str, status: str) -> None:
+        ip_source_statuses.setdefault(ip_addr, {})[source] = status
 
     for ip in seed_ip_list:
         if shodan_available:
@@ -1307,6 +1693,7 @@ def run_passive_intel(
             except Exception as exc:  # a single host lookup must not abort the rest
                 r = {"status": "error", "error": str(exc), "host": None}
             shodan_host_lookups.append({"ip": ip, "status": r["status"], "error": r.get("error")})
+            effective = r["status"]
             if r["status"] == "found":
                 try:
                     norm = normalize_shodan_host(r["host"], target)
@@ -1317,6 +1704,17 @@ def run_passive_intel(
                     norm["discovered_via"] = "seed_ip_lookup"
                     normalized_records.append(norm)
                     ips_with_data.add(ip)
+                else:
+                    # Shodan HAD a record; this module could not normalize it.
+                    # Recording that as "no data" would be a false negative and
+                    # would silently discard the fact that data exists.
+                    effective = CHECK_UNPARSABLE
+                    summary["errors"].append({
+                        "stage": "normalize_shodan_host", "ip": ip,
+                        "error": "Shodan returned a record that could not be normalized "
+                                 "(no usable ip_str); record not persisted",
+                    })
+            _record_status(ip, "shodan", effective)
 
         if censys_available:
             try:
@@ -1324,6 +1722,7 @@ def run_passive_intel(
             except Exception as exc:
                 r = {"status": "error", "error": str(exc), "host": None}
             censys_host_lookups.append({"ip": ip, "status": r["status"], "error": r.get("error")})
+            effective = r["status"]
             if r["status"] == "found":
                 try:
                     norm = normalize_censys_host(r["host"], target)
@@ -1334,6 +1733,14 @@ def run_passive_intel(
                     norm["discovered_via"] = "seed_ip_lookup"
                     normalized_records.append(norm)
                     ips_with_data.add(ip)
+                else:
+                    effective = CHECK_UNPARSABLE
+                    summary["errors"].append({
+                        "stage": "normalize_censys_host", "ip": ip,
+                        "error": "Censys returned a record that could not be normalized "
+                                 "(no usable ip); record not persisted",
+                    })
+            _record_status(ip, "censys", effective)
 
     if shodan_host_lookups:
         summary["source_status"]["shodan_host_lookups"] = shodan_host_lookups
@@ -1343,11 +1750,18 @@ def run_passive_intel(
     if include_hostname_search:
         if shodan_available:
             try:
-                r = search_shodan_by_hostname(target, shodan_api_key, timeout=timeout)
+                r = search_shodan_by_hostname(
+                    target, shodan_api_key, timeout=timeout, max_pages=max_search_pages)
             except Exception as exc:
                 r = {"status": "error", "error": str(exc), "matches": [], "total": 0}
+            # `total` alone silently implied completeness: a run reporting
+            # total=5000 while holding 100 matches looked like a full result.
             summary["source_status"]["shodan_hostname_search"] = {
                 "status": r["status"], "error": r.get("error"), "total": r.get("total", 0),
+                "retrieved": r.get("retrieved", len(r.get("matches") or [])),
+                "truncated": r.get("truncated", False),
+                "pages_fetched": r.get("pages_fetched", 0),
+                "page_error": r.get("page_error"),
             }
             if r["status"] == "found":
                 for match in r["matches"]:
@@ -1363,11 +1777,17 @@ def run_passive_intel(
 
         if censys_available:
             try:
-                r = search_censys_by_hostname(target, censys_api_id, censys_api_secret, timeout=timeout)
+                r = search_censys_by_hostname(
+                    target, censys_api_id, censys_api_secret, timeout=timeout,
+                    max_pages=max_search_pages)
             except Exception as exc:
                 r = {"status": "error", "error": str(exc), "hits": [], "total": 0}
             summary["source_status"]["censys_hostname_search"] = {
                 "status": r["status"], "error": r.get("error"), "total": r.get("total", 0),
+                "retrieved": r.get("retrieved", len(r.get("hits") or [])),
+                "truncated": r.get("truncated", False),
+                "pages_fetched": r.get("pages_fetched", 0),
+                "page_error": r.get("page_error"),
             }
             if r["status"] == "found":
                 for hit in r["hits"]:
@@ -1388,9 +1808,20 @@ def run_passive_intel(
 
     no_data_ips = [ip for ip in seed_ip_list if ip not in ips_with_data]
     if sources_checked and no_data_ips:
-        negmem_errors = persist_no_data_findings(no_data_ips, target, sources_checked, store)
+        negmem_errors = persist_no_data_findings(
+            no_data_ips, target, sources_checked, store,
+            ip_source_statuses=ip_source_statuses,
+        )
         if negmem_errors:
             summary["errors"].append({"stage": "negative_result_memory", "errors": negmem_errors})
+
+    # Split the counters so a run against a throttled/unpaid provider can never
+    # be read as "we checked these hosts and they had nothing".
+    confirmed_absent_ips = [
+        ip for ip in no_data_ips
+        if classify_ip_check(ip_source_statuses.get(ip, {}))["outcome"] == "not_found"
+    ]
+    inconclusive_ips = [ip for ip in no_data_ips if ip not in set(confirmed_absent_ips)]
 
     summary["hosts"] = merged
     summary["stats"] = {
@@ -1398,8 +1829,12 @@ def run_passive_intel(
         "hosts_found": len(merged),
         "services_found": sum(len(h["services"]) for h in merged),
         "certificates_found": sum(len(h["certificates"]) for h in merged),
-        "hosts_checked_no_data": len(no_data_ips) if sources_checked else 0,
+        "hosts_checked_no_data": len(confirmed_absent_ips) if sources_checked else 0,
+        "hosts_check_inconclusive": len(inconclusive_ips) if sources_checked else 0,
         "sources_used": sources_checked,
+    }
+    summary["ip_check_outcomes"] = {
+        ip: classify_ip_check(statuses) for ip, statuses in sorted(ip_source_statuses.items())
     }
     summary["finished_at"] = _now()
     return summary
