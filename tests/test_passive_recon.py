@@ -184,6 +184,67 @@ class TestPendingAssetsStore:
         leftovers = [p for p in os.listdir(store.output_dir) if p.startswith(".pending_assets_")]
         assert leftovers == []
 
+    def test_rename_is_made_durable_by_fsyncing_the_directory(self, tmp_path):
+        """os.replace() is atomic but the directory entry must also be synced."""
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+        with mock.patch.object(pr.PendingAssetsStore, "_fsync_dir", autospec=True) as fsync_dir:
+            store.add(pr.make_finding("dns_record", "example.com", {}, ["e"], pr.CONFIDENCE_LOW))
+        assert fsync_dir.call_count == 1
+        assert fsync_dir.call_args.args[0] == os.path.dirname(store.path)
+
+    def test_fsync_dir_failure_does_not_lose_the_write(self, tmp_path):
+        """Directory fsync is best-effort; a platform that refuses it must not
+        turn a successful append into a failure."""
+        # An unopenable directory and a refused fsync must both be tolerated.
+        pr.PendingAssetsStore._fsync_dir(str(tmp_path / "does-not-exist"))
+        with mock.patch.object(pr.os, "fsync", side_effect=OSError("EINVAL")):
+            pr.PendingAssetsStore._fsync_dir(str(tmp_path))
+
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+        with mock.patch.object(pr.PendingAssetsStore, "_fsync_dir", side_effect=OSError("EINVAL")):
+            with pytest.raises(OSError):
+                store.add(pr.make_finding("whois", "example.com", {}, ["e"], pr.CONFIDENCE_LOW))
+        # A failed durability step is surfaced, never silently reported as a
+        # successful persist, and leaves no temp file behind.
+        leftovers = [p for p in os.listdir(store.output_dir) if p.startswith(".pending_assets_")]
+        assert leftovers == []
+
+    def test_concurrent_adds_lose_no_records(self, tmp_path):
+        """The per-store lock plus read-before-write must not drop findings."""
+        import threading
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+        errors = []
+
+        def worker(n):
+            try:
+                for i in range(5):
+                    store.add(pr.make_finding("dns_record", "example.com", {"w": n, "i": i},
+                                              ["e"], pr.CONFIDENCE_LOW))
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        records = store.all()
+        assert len(records) == 20
+        assert {(r["value"]["w"], r["value"]["i"]) for r in records} == {
+            (w, i) for w in range(4) for i in range(5)
+        }
+        with open(store.path) as f:
+            json.load(f)  # still valid JSON after all operations
+
+    def test_repeated_writes_stay_valid_json(self, tmp_path):
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+        for i in range(10):
+            store.add(pr.make_finding("dns_record", "example.com", {"i": i}, ["e"], pr.CONFIDENCE_LOW))
+            with open(store.path) as f:
+                assert len(json.load(f)) == i + 1
+
 
 # ---------------------------------------------------------------------------
 # enumerate_dns (mocked resolver)
@@ -284,6 +345,209 @@ class TestWhoisLookup:
 
 
 # ---------------------------------------------------------------------------
+# whois_lookup — provider-failure classification, bounded retry, privacy
+# semantics. Regression coverage for the "provider failure vs. genuine
+# no-data" and "privacy placeholder vs. real registrant" distinctions.
+# ---------------------------------------------------------------------------
+
+def _whois_exc(name):
+    """The typed python-whois exception `name`, or None if this release lacks it."""
+    exceptions = getattr(pr.python_whois, "exceptions", None)
+    return getattr(exceptions, name, None) if exceptions else None
+
+
+class TestWhoisErrorClassification:
+    def test_domain_not_found_is_negative_result_not_error(self):
+        cls = _whois_exc("WhoisDomainNotFoundError")
+        exc = cls("No match for EXAMPLE.INVALID") if cls else Exception("No match for EXAMPLE.INVALID")
+        with mock.patch.object(pr, "_whois_query", side_effect=exc), \
+             mock.patch.object(pr.time, "sleep") as sleep:
+            result = pr.whois_lookup("example.com")
+        assert result["status"] == "not_found"
+        assert result["error_class"] == pr.WHOIS_ERROR_NO_MATCH
+        assert result["completeness"] == "empty"
+        # A domain that does not exist will not exist on a second query.
+        assert result["attempts"] == 1
+        assert sleep.call_count == 0
+
+    def test_rate_limit_is_retried_a_bounded_number_of_times(self):
+        cls = _whois_exc("WhoisQuotaExceededError")
+        exc = cls("quota exceeded") if cls else Exception("quota exceeded")
+        with mock.patch.object(pr, "_whois_query", side_effect=exc) as query, \
+             mock.patch.object(pr.time, "sleep") as sleep:
+            result = pr.whois_lookup("example.com", max_attempts=3, backoff=2.0)
+        assert result["status"] == "error"
+        assert result["error_class"] == pr.WHOIS_ERROR_RATE_LIMITED
+        assert result["attempts"] == 3
+        assert query.call_count == 3          # bounded — never a retry storm
+        assert sleep.call_count == 2          # one pause between each attempt
+        # Conservative exponential backoff, not a tight loop.
+        assert [c.args[0] for c in sleep.call_args_list] == [2.0, 4.0]
+
+    def test_rate_limit_detected_from_message_when_untyped(self):
+        with mock.patch.object(pr, "_whois_query", side_effect=Exception("Please try again later")), \
+             mock.patch.object(pr.time, "sleep"):
+            result = pr.whois_lookup("example.com", max_attempts=2)
+        assert result["error_class"] == pr.WHOIS_ERROR_RATE_LIMITED
+
+    def test_timeout_is_classified_and_retried(self):
+        with mock.patch.object(pr, "_whois_query", side_effect=TimeoutError("timed out")) as query, \
+             mock.patch.object(pr.time, "sleep"):
+            result = pr.whois_lookup("example.com", max_attempts=2)
+        assert result["status"] == "error"
+        assert result["error_class"] == pr.WHOIS_ERROR_TIMEOUT
+        assert query.call_count == 2
+
+    def test_unsupported_tld_is_not_retried(self):
+        cls = _whois_exc("UnknownTldError")
+        exc = cls("unknown tld") if cls else None
+        if exc is None:
+            pytest.skip("installed python-whois has no UnknownTldError")
+        with mock.patch.object(pr, "_whois_query", side_effect=exc) as query, \
+             mock.patch.object(pr.time, "sleep") as sleep:
+            result = pr.whois_lookup("example.com", max_attempts=3)
+        assert result["status"] == "error"
+        assert result["error_class"] == pr.WHOIS_ERROR_UNSUPPORTED_TLD
+        assert query.call_count == 1
+        assert sleep.call_count == 0
+
+    def test_transient_failure_then_success(self, tmp_path):
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+        outcomes = [ConnectionResetError("connection reset by peer"),
+                    {"domain_name": "EXAMPLE.COM", "registrar": "Example Registrar"}]
+
+        def flaky(target, timeout):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with mock.patch.object(pr, "_whois_query", side_effect=flaky), \
+             mock.patch.object(pr.time, "sleep"):
+            result = pr.whois_lookup("example.com", store=store, max_attempts=3)
+
+        assert result["status"] == "found"
+        assert result["attempts"] == 2
+        assert result["error"] is None and result["error_class"] is None
+        persisted = store.all()
+        assert persisted[0]["metadata"]["attempts"] == 2
+        assert any("2 attempt(s)" in e for e in persisted[0]["evidence"])
+
+    def test_max_attempts_one_disables_retry(self):
+        with mock.patch.object(pr, "_whois_query", side_effect=Exception("quota exceeded")) as query, \
+             mock.patch.object(pr.time, "sleep") as sleep:
+            pr.whois_lookup("example.com", max_attempts=1)
+        assert query.call_count == 1
+        assert sleep.call_count == 0
+
+    def test_provider_failure_is_not_reported_as_no_data(self):
+        with mock.patch.object(pr, "_whois_query", side_effect=Exception("connection refused")), \
+             mock.patch.object(pr.time, "sleep"):
+            result = pr.whois_lookup("example.com", max_attempts=1)
+        assert result["status"] == "error"
+        assert result["status"] != "not_found"
+        assert result["error_class"] == pr.WHOIS_ERROR_PROVIDER_UNAVAILABLE
+
+
+class TestWhoisPrivacySemantics:
+    def test_complete_response_is_full_and_high_confidence(self, tmp_path):
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+        record = {"domain_name": "EXAMPLE.COM", "registrar": "Example Registrar",
+                  "org": "Example Corporation"}
+        with mock.patch.object(pr.python_whois, "whois", return_value=record):
+            result = pr.whois_lookup("example.com", store=store)
+        assert result["completeness"] == "full"
+        assert result["redacted_fields"] == {}
+        assert result["data"]["org"] == "Example Corporation"
+        assert store.all()[0]["confidence"] == pr.CONFIDENCE_HIGH
+
+    def test_redacted_org_is_not_presented_as_registrant_data(self, tmp_path):
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+        record = {"domain_name": "EXAMPLE.COM", "registrar": "Example Registrar",
+                  "org": "REDACTED FOR PRIVACY", "country": "Data Protected"}
+        with mock.patch.object(pr.python_whois, "whois", return_value=record):
+            result = pr.whois_lookup("example.com", store=store)
+
+        assert result["status"] == "found"
+        assert result["completeness"] == "partial_redacted"
+        # The placeholder must never reach surface_mapper's org handler as an
+        # organization name, but it is preserved, not discarded.
+        assert "org" not in result["data"]
+        assert "country" not in result["data"]
+        assert result["redacted_fields"]["org"] == "REDACTED FOR PRIVACY"
+        assert result["data"]["registrar"] == "Example Registrar"
+
+        finding = store.all()[0]
+        assert finding["value"]["redacted_fields"]["org"] == "REDACTED FOR PRIVACY"
+        assert "org" not in finding["value"]
+        assert finding["confidence"] == pr.CONFIDENCE_MEDIUM
+        assert finding["metadata"]["completeness"] == "partial_redacted"
+        assert finding["metadata"]["redacted_fields"] == ["country", "org"]
+        assert any("withheld" in e for e in finding["evidence"])
+
+    def test_redacted_org_does_not_reach_organization_summary(self, tmp_path):
+        record = {"domain_name": "EXAMPLE.COM", "org": "Withheld for privacy"}
+        with mock.patch.object(pr.python_whois, "whois", return_value=record):
+            whois_result = pr.whois_lookup("example.com")
+        summary = pr._build_organization_summary({"whois": whois_result, "asn": []})
+        assert summary["whois_organizations"] == []
+
+    def test_infrastructure_fields_are_never_screened_as_redacted(self, tmp_path):
+        """
+        Regression: privacy-service *hostnames* legitimately contain the same
+        wording as privacy *placeholders*. Screening them would delete real
+        nameservers and the real registrar from the asset graph.
+        """
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+        record = {
+            "domain_name": "EXAMPLE.COM",
+            "registrar": "Domains By Proxy, LLC",
+            "whois_server": "whois.privacyprotect.org",
+            "name_servers": ["ns1.privacyprotect.org", "ns2.privacyprotect.org"],
+            "org": "REDACTED FOR PRIVACY",
+        }
+        with mock.patch.object(pr.python_whois, "whois", return_value=record):
+            result = pr.whois_lookup("example.com", store=store)
+
+        # Genuine infrastructure survives untouched...
+        assert result["data"]["name_servers"] == ["ns1.privacyprotect.org", "ns2.privacyprotect.org"]
+        assert result["data"]["registrar"] == "Domains By Proxy, LLC"
+        assert result["data"]["whois_server"] == "whois.privacyprotect.org"
+        # ...while only the registrant attribution is screened.
+        assert sorted(result["redacted_fields"]) == ["org"]
+
+    def test_screened_fields_are_limited_to_registrant_attribution(self):
+        assert pr._WHOIS_REDACTABLE_FIELDS == {"org", "country", "emails"}
+        for field in ("registrar", "whois_server", "name_servers", "domain_name", "status"):
+            assert field not in pr._WHOIS_REDACTABLE_FIELDS
+
+    def test_fully_redacted_response_is_still_found_not_missing(self):
+        record = {"org": "REDACTED FOR PRIVACY"}
+        with mock.patch.object(pr.python_whois, "whois", return_value=record):
+            result = pr.whois_lookup("example.com")
+        assert result["status"] == "found"
+        assert result["completeness"] == "partial_redacted"
+
+    def test_empty_response_is_empty_completeness(self):
+        with mock.patch.object(pr.python_whois, "whois", return_value={}):
+            result = pr.whois_lookup("example.com")
+        assert result["status"] == "not_found"
+        assert result["completeness"] == "empty"
+        assert result["error_class"] is None
+
+    def test_redacted_finding_is_json_serializable(self, tmp_path):
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+        record = {"domain_name": "EXAMPLE.COM", "org": "REDACTED FOR PRIVACY",
+                  "emails": ["privacy@proxy.example"]}
+        with mock.patch.object(pr.python_whois, "whois", return_value=record):
+            pr.whois_lookup("example.com", store=store)
+        json.dumps(store.all())
+
+    def test_nested_dict_values_are_json_safe_not_stringified(self):
+        assert pr._jsonify({"a": {"b": [1, 2]}}) == {"a": {"b": [1, 2]}}
+
+
+# ---------------------------------------------------------------------------
 # discover_tls_certificate (mocked socket/ssl + real cert parsing)
 # ---------------------------------------------------------------------------
 
@@ -362,6 +626,26 @@ class TestDiscoverTlsCertificate:
         with mock.patch("socket.create_connection", side_effect=socket.timeout("timed out")):
             result = pr.discover_tls_certificate("example.com")
         assert result["status"] == "error"
+        assert result["error_class"] == "timeout"
+
+    def test_tls_handshake_failure_is_classified_not_swallowed_as_oserror(self):
+        """ssl.SSLError subclasses OSError; it must not be shadowed by it."""
+        import ssl as _ssl
+        with mock.patch("socket.create_connection", side_effect=_ssl.SSLError("handshake failure")):
+            result = pr.discover_tls_certificate("example.com")
+        assert result["status"] == "error"
+        assert result["error_class"] == "tls_handshake_failed"
+        assert "TLS handshake failed" in result["error"]
+
+    def test_connection_refused_has_its_own_error_class(self):
+        with mock.patch("socket.create_connection", side_effect=ConnectionRefusedError("refused")):
+            result = pr.discover_tls_certificate("example.com")
+        assert result["error_class"] == "connection_failed"
+
+    def test_name_resolution_failure_has_its_own_error_class(self):
+        with mock.patch("socket.create_connection", side_effect=socket.gaierror("no such host")):
+            result = pr.discover_tls_certificate("example.com")
+        assert result["error_class"] == "name_resolution_failed"
 
 
 # ---------------------------------------------------------------------------
@@ -398,10 +682,33 @@ class TestDiscoverAsn:
         result = pr.discover_asn("::1")
         assert result["status"] == "error"
 
-    def test_cymru_lookup_failure_is_error_not_crash(self):
+    def test_nxdomain_is_not_announced_not_an_error(self):
+        """Cymru answering NXDOMAIN means the IP is in no announced prefix."""
         with mock.patch.object(dns.resolver.Resolver, "resolve", side_effect=dns.resolver.NXDOMAIN()):
-            result = pr.discover_asn("192.0.2.1")
+            result = pr.discover_asn("93.184.216.34")
+        assert result["status"] == "not_found"
+        assert result["error_class"] == "not_announced"
+
+    def test_resolver_timeout_is_error_not_a_negative_result(self):
+        import dns.exception
+        with mock.patch.object(dns.resolver.Resolver, "resolve", side_effect=dns.exception.Timeout()):
+            result = pr.discover_asn("93.184.216.34")
         assert result["status"] == "error"
+        assert result["error_class"] == "timeout"
+
+    def test_generic_lookup_failure_is_error_not_crash(self):
+        with mock.patch.object(dns.resolver.Resolver, "resolve", side_effect=dns.resolver.NoNameservers()):
+            result = pr.discover_asn("93.184.216.34")
+        assert result["status"] == "error"
+        assert result["error_class"] == "lookup_failed"
+
+    def test_private_ip_is_skipped_without_querying_cymru(self):
+        """Cymru maps announced space only; querying it for RFC1918 is pointless."""
+        with mock.patch.object(dns.resolver.Resolver, "resolve", side_effect=AssertionError("must not query")) as m:
+            result = pr.discover_asn("10.0.0.5")
+        assert result["status"] == "not_found"
+        assert result["error_class"] == "not_globally_routable"
+        assert m.call_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +736,7 @@ class TestAnalyzeEmailSecurity:
 
         assert result["spf"]["status"] == "found"
         assert result["dmarc"]["status"] == "found"
-        assert result["dkim"]["status"] == "not_found"
+        assert result["dkim"]["status"] == pr.DKIM_NOT_FOUND_AMONG_TESTED
         assert result["mx"]["status"] == "found"
         assert result["mx"]["records"][0]["exchange"] == "mail.example.com"
 
@@ -457,8 +764,135 @@ class TestAnalyzeEmailSecurity:
         with mock.patch.object(dns.resolver.Resolver, "resolve", fake_resolve):
             result = pr.analyze_email_security("example.com")
 
-        assert result["dkim"]["status"] == "found"
+        assert result["dkim"]["status"] == pr.DKIM_FOUND
         assert result["dkim"]["found_selectors"][0]["selector"] == "default"
+        assert result["dkim"]["exhaustive"] is False
+
+
+class TestDkimSemantics:
+    """
+    DKIM is a sampled check. The module must never turn "no record among the
+    selectors we tested" into "this domain has no DKIM", and must never turn a
+    failed lookup into a negative result at all.
+    """
+
+    @staticmethod
+    def _resolver(dkim_side_effect):
+        def fake_resolve(self, qname, rtype, *a, **kw):
+            qname = str(qname)
+            if "_domainkey" in qname:
+                return dkim_side_effect(qname)
+            raise dns.resolver.NXDOMAIN()
+        return fake_resolve
+
+    def test_all_selectors_authoritatively_absent(self, tmp_path):
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+
+        def absent(qname):
+            raise dns.resolver.NXDOMAIN()
+
+        with mock.patch.object(dns.resolver.Resolver, "resolve", self._resolver(absent)):
+            result = pr.analyze_email_security("example.com", store=store)
+
+        dkim = result["dkim"]
+        assert dkim["status"] == pr.DKIM_NOT_FOUND_AMONG_TESTED
+        assert dkim["status"] != "not_found"        # must not read as global absence
+        assert dkim["selectors_without_record"] == dkim["selectors_checked"]
+        assert dkim["selectors_errored"] == []
+        assert dkim["exhaustive"] is False
+
+        finding = store.all()[0]
+        assert finding["metadata"]["dkim_exhaustive"] is False
+        evidence = " ".join(finding["evidence"])
+        assert "not evidence that DKIM is unconfigured" in evidence
+
+    def test_lookup_failures_are_inconclusive_not_absent(self, tmp_path):
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+
+        def failing(qname):
+            raise dns.exception.Timeout()
+
+        with mock.patch.object(dns.resolver.Resolver, "resolve", self._resolver(failing)):
+            result = pr.analyze_email_security("example.com", store=store)
+
+        dkim = result["dkim"]
+        assert dkim["status"] == pr.DKIM_INCONCLUSIVE
+        assert dkim["selectors_without_record"] == []
+        assert len(dkim["selectors_errored"]) == len(dkim["selectors_checked"])
+        assert dkim["selectors_errored"][0]["selector"] in dkim["selectors_checked"]
+
+        evidence = " ".join(store.all()[0]["evidence"])
+        assert "inconclusive" in evidence
+        assert "no authoritative negative was established" in evidence
+
+    def test_partial_failures_still_inconclusive(self):
+        def mixed(qname):
+            if qname.startswith("default."):
+                raise dns.resolver.NXDOMAIN()
+            raise dns.exception.Timeout()
+
+        with mock.patch.object(dns.resolver.Resolver, "resolve", self._resolver(mixed)):
+            result = pr.analyze_email_security("example.com")
+        assert result["dkim"]["status"] == pr.DKIM_INCONCLUSIVE
+        assert result["dkim"]["selectors_without_record"] == ["default"]
+
+    def test_a_hit_wins_over_other_selectors_failing(self):
+        def mixed(qname):
+            if qname.startswith("google."):
+                return [_FakeRdata('"v=DKIM1; k=rsa; p=ABC"')]
+            raise dns.exception.Timeout()
+
+        with mock.patch.object(dns.resolver.Resolver, "resolve", self._resolver(mixed)):
+            result = pr.analyze_email_security("example.com")
+        assert result["dkim"]["status"] == pr.DKIM_FOUND
+        assert [s["selector"] for s in result["dkim"]["found_selectors"]] == ["google"]
+
+    def test_multiple_selectors_found_are_all_recorded(self):
+        def multi(qname):
+            if qname.startswith(("default.", "selector1.")):
+                return [_FakeRdata('"v=DKIM1; k=rsa; p=ABC"')]
+            raise dns.resolver.NXDOMAIN()
+
+        with mock.patch.object(dns.resolver.Resolver, "resolve", self._resolver(multi)):
+            result = pr.analyze_email_security("example.com")
+        assert {s["selector"] for s in result["dkim"]["found_selectors"]} == {"default", "selector1"}
+
+    def test_no_selectors_tested_is_not_tested(self):
+        with mock.patch.object(dns.resolver.Resolver, "resolve", side_effect=dns.resolver.NXDOMAIN()):
+            result = pr.analyze_email_security("example.com", dkim_selectors=[])
+        assert result["dkim"]["status"] == pr.DKIM_NOT_TESTED
+        assert result["dkim"]["selectors_checked"] == []
+
+    def test_dkim_status_alone_never_asserts_absence(self, tmp_path):
+        """Guards the value surface_mapper flattens into email_dkim_status."""
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+        with mock.patch.object(dns.resolver.Resolver, "resolve", side_effect=dns.resolver.NXDOMAIN()):
+            pr.analyze_email_security("example.com", store=store)
+        status = store.all()[0]["value"]["dkim"]["status"]
+        assert status not in ("not_found", "absent", "none")
+
+
+class TestEmailRecordConflicts:
+    def test_multiple_spf_records_are_preserved_as_a_conflict(self, tmp_path):
+        store = pr.PendingAssetsStore(output_dir=str(tmp_path / "output"))
+
+        def fake_resolve(self, qname, rtype, *a, **kw):
+            qname = str(qname)
+            if rtype == "TXT" and "_domainkey" in qname:
+                raise dns.resolver.NXDOMAIN()
+            if rtype == "TXT" and qname.startswith("_dmarc."):
+                raise dns.resolver.NXDOMAIN()
+            if rtype == "TXT":
+                return [_FakeRdata('"v=spf1 include:a -all"'), _FakeRdata('"v=spf1 include:b ~all"')]
+            raise dns.resolver.NXDOMAIN()
+
+        with mock.patch.object(dns.resolver.Resolver, "resolve", fake_resolve):
+            result = pr.analyze_email_security("example.com", store=store)
+
+        assert result["spf"]["status"] == "found"
+        assert len(result["spf"]["records"]) == 2
+        assert "2 SPF records" in result["spf"]["conflict"]
+        assert any("Conflict:" in e for e in store.all()[0]["evidence"])
 
 
 # ---------------------------------------------------------------------------
