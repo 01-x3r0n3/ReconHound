@@ -33,14 +33,14 @@ precedent).
 
 BUILD-ORDER NOTE: context.md §13 lists this module at build-order position
 16, after surface_mapper.py (position 8). Per wayback_intel.py's,
-vuln_intel.py's and passive_intel.py's module docstrings, this repository
-is already operating under an explicit, user-approved deviation from that
-order — surface_mapper.py has not been implemented yet. This module
-continues under the same deviation, for the same reason: it is implemented
-as a fully standalone producer that does not implement, replace, or depend
-on surface_mapper.py's correlation engine, and does not touch any other
-unimplemented module (risk_engine.py, core/orchestrator.py, reconhound.py,
-tech_fingerprint.py, osint_engine.py, etc.).
+vuln_intel.py's and passive_intel.py's module docstrings, this module was
+built under an explicit, user-approved deviation from that order, before
+surface_mapper.py existed. That deviation shapes what this file is and
+remains true of it: it is a fully standalone producer that does not
+implement, replace, call into or import surface_mapper.py's correlation
+engine, risk_engine.py, core/orchestrator.py or any other module. It
+communicates in one direction only, by writing findings to
+pending_assets.json, and those consumers now exist and read it from there.
 
 PASSIVE BOUNDARY (context.md §16, assignment "DISCOVERY BOUNDARY"): this
 module's only network interactions are with GitHub's public REST Search
@@ -64,6 +64,14 @@ hit is discarded outright and only counted in `stats.private_repos_skipped`.
 This is enforced even though this module never supplied credentials with
 such access itself; the check does not depend on the caller's intent.
 
+The check fails CLOSED: an item whose repository object is missing or is
+not a JSON object is withheld too (counted in
+`stats.items_unverifiable_repo`), because its public/private state was
+never established. The raw value is passed to `_is_private_repo`
+unmodified — substituting an empty dict first would read as "public" and
+quietly defeat the safeguard for exactly the malformed responses it exists
+to catch.
+
 CONTENT-INSPECTION BOUNDARY: this module never fetches a matched file's
 full raw contents (that would exceed "the approved GitHub API/search
 mechanism" and drift toward the prohibited "clone repositories"
@@ -74,6 +82,16 @@ type — a short, GitHub-selected excerpt around the query match. This is a
 real limitation: a secret whose sensitive portion falls outside that
 excerpt will not be found. That tradeoff is deliberate and documented
 here rather than silently accepted.
+
+HISTORICAL COVERAGE: for the same reason, this module sees only what
+GitHub's code index currently holds for a repository's default branch. It
+does not search commit history, deleted files, other branches, or forks —
+a secret committed and then removed remains in the repository's history
+and stays invisible here. Reaching it would require cloning and walking
+repositories, which this module's content-inspection boundary above rules
+out. This is an architectural limitation of passive GitHub-Search-API
+intelligence, not an unimplemented feature: it is stated so the absence of
+a finding is never read as the absence of a historical exposure.
 
 CREDENTIAL HANDLING: GitHub's code-search endpoint
 (GET /search/code) requires authentication — GitHub does not serve
@@ -92,10 +110,42 @@ NEGATIVE-RESULT MEMORY (context.md §8/§12.6): GitHub's code index only
 covers what GitHub has indexed at query time; a query returning no hits is
 NOT proof the target has no exposed code — it may be indexed later, or
 live in a private/self-hosted repo GitHub never sees. Every code-search
-query that completes with zero (non-private) hits gets an explicit
+query that completes with zero hits gets an explicit
 `code_leak_checked_no_match` finding (mirroring passive_intel.py's
 `passive_intel_checked_no_data` / vuln_intel.py's
 `vuln_intel_checked_no_match` precedent) rather than silence.
+
+"Checked and not found" is reserved for that case alone. A query is
+INCONCLUSIVE — reported in `stats.code_queries_inconclusive` and never
+written as a negative result — when it produced nothing usable for any
+reason other than absence: every result on the page withheld as private or
+unverifiable while GitHub reported matches, or GitHub setting
+`incomplete_results`. surface_mapper.py stores a negative result as a
+CHECK_NOT_FOUND state that suppresses repeated work, so labelling a
+withheld or truncated search "not found" would write a false conclusion
+into the graph's memory.
+
+RESULT COMPLETENESS: this module issues exactly one page per query and
+never paginates, so it never multiplies its request volume against GitHub's
+search limits — and GitHub caps search pagination at 1,000 results per
+query regardless. What it examines is therefore a bounded sample of a
+potentially much larger match set. That bound is reported rather than
+implied: every per-query status carries `items_examined`, `total_count`,
+`total_count_reported` (GitHub omitting the count is recorded as unknown,
+not as "the page is everything"), GitHub's own `incomplete_results` flag,
+and `results_truncated`.
+
+TARGET ASSOCIATION (context.md §16, strict scope enforcement): every query
+this module issues is anchored on the literal target hostname, but a
+GitHub text match is a *textual* link, never proof of ownership. A
+repository that merely mentions the target in a README is surfaced exactly
+like one the target operates, and this module has no passive way to tell
+them apart. It therefore does not try: findings record what was observed
+(`repo_full_name`, `path`, `source_url`, and
+`target_string_in_fragment` — whether the target string was actually
+present in the inspected excerpt or only in the file somewhere) and leave
+attribution to the analyst. No weak textual match is ever promoted into an
+ownership claim.
 
 INPUT-CONTRACT DECISIONS (ambiguities resolved so implementation can
 proceed without inventing a competing asset model, mirroring
@@ -112,17 +162,31 @@ the same surface_mapper.py gap):
      by more than one dork query (e.g. both the generic mention query and
      the "password" keyword query surface the same file). Findings are
      aggregated by (repository, path, category, value-fingerprint) before
-     persistence — see `_aggregate_code_finding` — both to avoid duplicate
-     pending_assets.json entries and because independent queries
-     converging on the same sighting is itself a confidence signal
-     (context.md §8): confidence is escalated to HIGH when >=2 distinct
-     queries surface the same aggregated finding.
+     persistence — see `_aggregate_code_finding` — so the same sighting
+     produces one pending_assets.json entry, and the full set of queries
+     that surfaced it is recorded as evidence in `matched_via_queries`.
+     Convergence across dorks does NOT raise confidence: context.md §8
+     raises confidence for *independent* converging signals, and these
+     queries are not independent — DEFAULT_CODE_SEARCH_QUERIES' unqualified
+     `"{target}"` query is a strict superset of every keyword-qualified
+     query in the list, so overlap is guaranteed by construction rather
+     than corroborating. Confidence is the detection pattern's own
+     confidence, adjusted only downward by decision #5.
   3. Secrets are never stored verbatim. Every matched value is reduced to
      `_redact_secret()` (first/last few characters, middle masked) plus a
      SHA-256 `fingerprint_sha256` (for downstream exact-match correlation
      without re-exposing the value) — satisfying the assignment's "avoid
      storing complete secrets unnecessarily... preserve enough evidence to
-     identify and investigate" instruction.
+     identify and investigate" instruction. This applies to the stored
+     `context` excerpt too: EVERY secret detected anywhere in a fragment is
+     redacted before that fragment is stored, not just the one belonging to
+     the finding being built, because a single .env excerpt routinely holds
+     several secrets and each finding stores the same shared excerpt. A
+     pattern whose match is a constant marker rather than a value (the PEM
+     armour header) is flagged `value_is_marker` and emits no fingerprint:
+     hashing a constant would give every private key ever found an
+     identical `fingerprint_sha256`, and risk_engine.py discriminates
+     leaked-credential signals by exactly that field.
   4. Category taxonomy (assignment's required finding categories) is
      enforced as a closed set: api_key, token, credential,
      db_connection_string, config_file, internal_url,
@@ -132,7 +196,19 @@ the same surface_mapper.py gap):
      `.aws/credentials`) rather than content-pattern-based, and are
      reported independently of whether that same file also triggered a
      content-based secret match.
-  5. GitHub Search API response shapes below reflect GitHub's public REST
+  5. Pattern matching is not judgement. A match whose value is obvious
+     documentation filler (`your_password_here`, `changeme`, a vendor's
+     published example key) or whose file is a template/vendored
+     third-party path is still extracted, still persisted and still carries
+     its full evidence — only its confidence is lowered and the reason
+     recorded in `quality_notes` (see `assess_placeholder` /
+     `assess_path_authority`). Suppressing such a finding would trade a
+     false positive for a false negative, which for credential exposure is
+     the strictly worse error. This matters downstream: risk_engine.py caps
+     a signal's severity by the confidence attached to it, so an unqualified
+     MEDIUM/HIGH on a placeholder is reported to the operator as a HIGH or
+     CRITICAL leaked credential.
+  6. GitHub Search API response shapes below reflect GitHub's public REST
      API documentation as of this implementation (`/search/code` items
      with an embedded `repository` object and optional `text_matches[]`;
      `/search/repositories` items as full repository objects). Every
@@ -182,6 +258,7 @@ MODULE_NAME = "code_leak.py"
 CONFIDENCE_LOW = "LOW"
 CONFIDENCE_MEDIUM = "MEDIUM"
 CONFIDENCE_HIGH = "HIGH"
+CONFIDENCE_ORDER: Dict[str, int] = {CONFIDENCE_LOW: 0, CONFIDENCE_MEDIUM: 1, CONFIDENCE_HIGH: 2}
 
 DEFAULT_USER_AGENT = "ReconHound-CodeLeak/1.0 (authorized security assessment)"
 DEFAULT_TIMEOUT = 15.0
@@ -410,15 +487,176 @@ def _redact_secret(value: str) -> str:
     return f"{value[:4]}{'*' * stars}{value[-4:]}"
 
 
+def _as_text(value: Any) -> str:
+    """
+    Coerce a provider-supplied field to a string without raising.
+
+    GitHub sends `path`/`name` as strings, but a malformed or evolving
+    response can send anything. Passing a non-string straight into a regex
+    raises TypeError, and the extractor's outer guard would then discard every
+    genuine secret found in that item — silent evidence loss.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return ""
+
+
 def _truncate(text: str, limit: int = 300) -> str:
     if text is None:
         return ""
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _redact_fragment(fragment: str, start: int, end: int, redacted_value: str) -> str:
-    """Return `fragment` with the raw-secret span [start:end) replaced by its redacted form."""
-    return f"{fragment[:start]}«{redacted_value}»{fragment[end:]}"
+def _redact_spans(fragment: str, spans: List[Tuple[int, int, str]]) -> str:
+    """
+    Return `fragment` with EVERY span in `spans` replaced by its redacted form.
+
+    One GitHub text-match fragment routinely contains several distinct secrets
+    (an AWS key, a password and a token on adjacent lines of the same .env
+    excerpt). Redacting only the span belonging to the finding being built
+    would leave every *other* secret in that fragment stored verbatim in the
+    finding's `context`, and from there in pending_assets.json, the asset
+    graph and the HTML report — defeating input-contract decision #3
+    ("Secrets are never stored verbatim") for every co-located secret.
+    Spans are applied right-to-left so earlier offsets stay valid.
+    """
+    usable = [
+        (start, end, redacted_value) for start, end, redacted_value in spans
+        if start is not None and end is not None and 0 <= start < end <= len(fragment)
+    ]
+    if not usable:
+        return fragment
+
+    # Distinct patterns overlap constantly: `generic_secret_assignment` matches
+    # the `password=` inside a connection string that `db_connection_string`
+    # already matched whole. Rewriting one span and then the other by raw
+    # offsets both corrupts the excerpt and can re-expose part of a value, so
+    # overlapping spans are merged into one interval first. A merged interval
+    # is replaced wholesale, which guarantees no byte of any matched value
+    # survives it.
+    merged: List[Tuple[int, int, List[str]]] = []
+    for start, end, redacted_value in sorted(usable, key=lambda s: (s[0], -s[1])):
+        if merged and start <= merged[-1][1]:
+            prev_start, prev_end, values = merged[-1]
+            if redacted_value not in values:
+                values.append(redacted_value)
+            merged[-1] = (prev_start, max(prev_end, end), values)
+        else:
+            merged.append((start, end, [redacted_value]))
+
+    out = fragment
+    for start, end, values in reversed(merged):
+        marker = values[0] if len(values) == 1 else " + ".join(values)
+        out = f"{out[:start]}«{marker}»{out[end:]}"
+    return out
+
+
+# Upper bound on how much of a single provider-supplied fragment is scanned.
+# GitHub's text-match fragments are short excerpts (a few hundred bytes); this
+# ceiling exists only so a non-conforming or hostile response cannot turn one
+# item into minutes of regex work and tens of thousands of findings. When it
+# bites, the finding records it rather than pretending the fragment was fully
+# inspected.
+MAX_FRAGMENT_CHARS = 65536
+
+# Upper bound on secret-pattern findings taken from a single fragment. Same
+# rationale; exceeding it is reported, never silently swallowed.
+MAX_FINDINGS_PER_FRAGMENT = 200
+
+
+# ---------------------------------------------------------------------------
+# Placeholder / non-authoritative-source assessment
+#
+# context.md §8 forbids presenting insufficient evidence as certainty, and
+# risk_engine.py caps a signal's severity by the confidence attached to it
+# (CONFIDENCE_SEVERITY_CAP). A documentation placeholder such as
+# `password = "your_password_here"` is a real pattern match but not a real
+# secret, and must not reach the operator as a CRITICAL leaked credential.
+#
+# Deliberately NOT implemented as a suppression filter: a flagged finding is
+# still extracted, still persisted, and still carries its full evidence — only
+# its confidence is lowered and the reason recorded. Dropping the finding
+# would trade a false positive for a false negative, which for credential
+# exposure is the strictly worse error.
+# ---------------------------------------------------------------------------
+
+# Whole words that only appear in filler/documentation values.
+_PLACEHOLDER_WORDS = frozenset({
+    "your", "yours", "here", "example", "examples", "sample", "samples",
+    "changeme", "change", "placeholder", "dummy", "fake", "todo", "tbd",
+    "replace", "replaceme", "insert", "myvalue", "value", "somevalue",
+    "notreal", "redacted", "xxx", "xxxx", "xxxxx", "abc", "test", "testing",
+})
+
+# Values that are literally published in vendor documentation and therefore
+# appear in thousands of unrelated repositories.
+_KNOWN_DOC_EXAMPLE_VALUES = frozenset({
+    "akiaiosfodnn7example",
+    "wjalrxutnfemi/k7mdeng/bpxrficyexamplekey",
+})
+
+_PLACEHOLDER_WRAPPED_RE = re.compile(r"^(?:<.*>|\{\{.*\}\}|\$\{.*\}|\[.*\])$")
+_PLACEHOLDER_TOKEN_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
+
+# Path markers that mean "this file is a template or third-party code, not the
+# repository's own live configuration".
+_TEMPLATE_PATH_RE = re.compile(
+    r"(?:^|/|\.)(?:example|examples|sample|samples|template|templates|dist|default)"
+    r"(?:$|/|\.)", re.IGNORECASE
+)
+_VENDORED_PATH_RE = re.compile(
+    r"(?:^|/)(?:node_modules|bower_components|vendor|third_party|thirdparty)/", re.IGNORECASE
+)
+
+
+def assess_placeholder(value: Optional[str]) -> Optional[str]:
+    """
+    Return a short reason if `value` looks like filler/documentation text
+    rather than a real secret, else None. Never raises.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    lowered = value.strip().lower()
+    if not lowered:
+        return None
+    if lowered in _KNOWN_DOC_EXAMPLE_VALUES:
+        return "value is a credential published verbatim in vendor documentation"
+    if _PLACEHOLDER_WRAPPED_RE.match(value.strip()):
+        return "value is a template placeholder token, not a literal"
+    stripped = re.sub(r"[^A-Za-z0-9]", "", lowered)
+    if stripped and len(set(stripped)) <= 2:
+        return "value is filler (two or fewer distinct characters)"
+    words = {w for w in _PLACEHOLDER_TOKEN_SPLIT_RE.split(lowered) if w}
+    hit = sorted(words & _PLACEHOLDER_WORDS)
+    if hit:
+        return f"value contains documentation-placeholder word(s): {', '.join(hit)}"
+    return None
+
+
+def assess_path_authority(path: Optional[str]) -> Optional[str]:
+    """
+    Return a short reason if `path` identifies a file that is a template or
+    vendored third-party code — i.e. a location whose contents are not the
+    repository's own live configuration — else None.
+    """
+    if not path or not isinstance(path, str):
+        return None
+    if _VENDORED_PATH_RE.search(path):
+        return "file lives in a vendored third-party dependency tree, not the repository's own code"
+    if _TEMPLATE_PATH_RE.search(path):
+        return "file path marks it as a template/example rather than live configuration"
+    return None
+
+
+_CONFIDENCE_DOWNGRADE = {
+    CONFIDENCE_HIGH: CONFIDENCE_MEDIUM,
+    CONFIDENCE_MEDIUM: CONFIDENCE_LOW,
+    CONFIDENCE_LOW: CONFIDENCE_LOW,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +693,12 @@ SECRET_PATTERNS: List[Dict[str, Any]] = [
     {
         "name": "private_key_block", "category": CATEGORY_CREDENTIAL, "confidence": CONFIDENCE_HIGH,
         "regex": re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"), "value_group": 0,
+        # The matched text is a constant PEM armour header, not the key material.
+        # Fingerprinting it would give every private key ever found the SAME
+        # fingerprint_sha256, and risk_engine.py discriminates leaked-credential
+        # signals by that fingerprint — so N distinct leaked keys would collapse
+        # into one signal and N-1 would vanish from the risk assessment.
+        "value_is_marker": True,
     },
     {
         "name": "jwt_token", "category": CATEGORY_TOKEN, "confidence": CONFIDENCE_LOW,
@@ -532,6 +776,23 @@ def _match_config_file_pattern(path: str) -> Optional[str]:
 # Private-repository safeguard
 # ---------------------------------------------------------------------------
 
+def _repo_object(item: Dict[str, Any]) -> Any:
+    """
+    Return the repository object embedded in a /search/code item, WITHOUT
+    substituting a benign default.
+
+    Coercing a missing or non-dict `repository` to `{}` before the private
+    check would defeat `_is_private_repo`'s fail-closed branch: `{}` reads as
+    public, so an item whose repository object could not be parsed would be
+    evidenced and persisted even though its public/private state was never
+    established. Returning the raw value keeps that decision with
+    `_is_private_repo`.
+    """
+    if not isinstance(item, dict):
+        return None
+    return item.get("repository")
+
+
 def _is_private_repo(repo_or_item: Dict[str, Any]) -> bool:
     """
     True if the embedded/standalone repository object is marked private.
@@ -573,7 +834,8 @@ def search_github_code(
     """
     result: Dict[str, Any] = {
         "status": "error", "items": [], "total_count": 0,
-        "incomplete_results": False, "error": None,
+        "total_count_reported": False, "items_examined": 0,
+        "incomplete_results": False, "results_truncated": False, "error": None,
     }
 
     if not query or not query.strip():
@@ -630,8 +892,21 @@ def search_github_code(
     items = data["items"]
     result["items"] = items
     total = data.get("total_count")
+    # A missing or non-integer total_count is not evidence that this page is
+    # everything there is, so completeness is recorded as unknown rather than
+    # inferred from the page size.
     result["total_count"] = total if isinstance(total, int) else len(items)
+    result["total_count_reported"] = isinstance(total, int)
+    result["items_examined"] = len(items)
     result["incomplete_results"] = bool(data.get("incomplete_results"))
+    # This module deliberately requests a single page — it never paginates, so
+    # it never multiplies its request volume against GitHub's search limits.
+    # Whenever GitHub reports more matches than the page it returned, what was
+    # examined here is a bounded sample, and saying so is the difference
+    # between "checked" and "checked as far as one page reaches".
+    result["results_truncated"] = bool(
+        result["total_count_reported"] and result["total_count"] > len(items)
+    )
     result["status"] = "found" if items else "not_found"
     return result
 
@@ -659,7 +934,8 @@ def search_github_repositories(
     """
     result: Dict[str, Any] = {
         "status": "error", "items": [], "total_count": 0,
-        "incomplete_results": False, "error": None,
+        "total_count_reported": False, "items_examined": 0,
+        "incomplete_results": False, "results_truncated": False, "error": None,
     }
 
     if not query or not query.strip():
@@ -705,10 +981,34 @@ def search_github_repositories(
     items = data["items"]
     result["items"] = items
     total = data.get("total_count")
+    # A missing or non-integer total_count is not evidence that this page is
+    # everything there is, so completeness is recorded as unknown rather than
+    # inferred from the page size.
     result["total_count"] = total if isinstance(total, int) else len(items)
+    result["total_count_reported"] = isinstance(total, int)
+    result["items_examined"] = len(items)
     result["incomplete_results"] = bool(data.get("incomplete_results"))
+    # This module deliberately requests a single page — it never paginates, so
+    # it never multiplies its request volume against GitHub's search limits.
+    # Whenever GitHub reports more matches than the page it returned, what was
+    # examined here is a bounded sample, and saying so is the difference
+    # between "checked" and "checked as far as one page reaches".
+    result["results_truncated"] = bool(
+        result["total_count_reported"] and result["total_count"] > len(items)
+    )
     result["status"] = "found" if items else "not_found"
     return result
+
+
+def _github_error_message(resp: "requests.Response") -> Optional[str]:
+    """Best-effort `message` field from a GitHub error body; never raises."""
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if isinstance(body, dict) and isinstance(body.get("message"), str):
+        return body["message"]
+    return None
 
 
 def _classify_github_status(resp: "requests.Response") -> Optional[Tuple[str, Optional[str]]]:
@@ -729,7 +1029,18 @@ def _classify_github_status(resp: "requests.Response") -> Optional[Tuple[str, Op
                 f"GitHub API secondary rate limit / abuse detection triggered "
                 f"(HTTP 403, Retry-After={resp.headers.get('Retry-After')}s)",
             )
-        return "unauthorized", "GitHub API returned HTTP 403 (insufficient token scope or blocked request)"
+        # GitHub documents that a secondary-rate-limit 403 may arrive with no
+        # Retry-After header at all, identifiable only from the body message.
+        # Classifying that as "unauthorized" tells the operator their token was
+        # rejected and sends them off to reissue a perfectly good credential.
+        message = _github_error_message(resp)
+        if message and ("secondary rate limit" in message.lower() or "abuse detection" in message.lower()):
+            return "rate_limited", f"GitHub API secondary rate limit triggered (HTTP 403): {message}"
+        detail = f": {message}" if message else ""
+        return (
+            "unauthorized",
+            f"GitHub API returned HTTP 403 (insufficient token scope or blocked request){detail}",
+        )
 
     if resp.status_code == 422:
         message = "GitHub API rejected the search query as invalid (HTTP 422)"
@@ -759,36 +1070,112 @@ def _classify_github_status(resp: "requests.Response") -> Optional[Tuple[str, Op
 # 2. Evidence extraction: secrets, config files, internal URLs, infra refs
 # ---------------------------------------------------------------------------
 
-def extract_findings_from_code_item(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _scan_fragment(
+    fragment: str,
+) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int, str]], bool, bool]:
+    """
+    Run every secret pattern over one fragment.
+
+    Returns (emitted matches, redaction spans, fragment_truncated,
+    findings_capped).
+
+    Every pattern is always run to completion over the (already length-capped)
+    fragment, and every match contributes a redaction span even when the
+    findings cap stops it becoming a finding. Stopping the scan early would
+    leave the values of the patterns that never ran unredacted in the shared
+    context — reintroducing exactly the co-located-secret leak `_redact_spans`
+    exists to prevent. Running every pattern over the 64 KB ceiling costs
+    ~0.03 s, so there is nothing to buy by stopping early.
+    """
+    matches: List[Dict[str, Any]] = []
+    spans: List[Tuple[int, int, str]] = []
+    fragment_truncated = len(fragment) > MAX_FRAGMENT_CHARS
+    if fragment_truncated:
+        fragment = fragment[:MAX_FRAGMENT_CHARS]
+    capped = False
+
+    for pat in SECRET_PATTERNS:
+        try:
+            for m in pat["regex"].finditer(fragment):
+                group_idx = pat["value_group"]
+                try:
+                    value = m.group(group_idx) if group_idx else m.group(0)
+                    start, end = m.start(group_idx), m.end(group_idx)
+                except IndexError:  # defensive: malformed group index
+                    continue
+                if not value:
+                    continue
+                redacted_value = _redact_secret(value)
+                spans.append((start, end, redacted_value))
+                if len(matches) >= MAX_FINDINGS_PER_FRAGMENT:
+                    capped = True
+                    continue
+                matches.append({
+                    "pattern": pat, "value": value, "redacted_value": redacted_value,
+                })
+        except Exception:
+            continue  # one malformed pattern must not abort the rest
+    return matches, spans, fragment_truncated, capped
+
+
+def extract_findings_from_code_item(
+    item: Dict[str, Any], target: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """
     Extract all category findings (secret-pattern matches + a possible
     config-file-path match) from one /search/code `items[]` entry.
 
     Private repositories are filtered out here as a last line of defense
     (module docstring, PRIVATE-REPOSITORY SAFEGUARD) even though callers
-    are also expected to filter before calling this. Never raises — a
-    malformed item degrades to an empty list, not a run-aborting
+    are also expected to filter before calling this — and an item whose
+    repository object is missing or unparseable is treated the same way,
+    because its public/private state cannot be established. Never raises —
+    a malformed item degrades to an empty list, not a run-aborting
     exception.
+
+    `target`, when supplied, is only used to record whether the target
+    string is actually present in the inspected fragment. That is an
+    observation about how strong the link between this sighting and the
+    target is, never a filter (module docstring, TARGET ASSOCIATION).
     """
     findings: List[Dict[str, Any]] = []
     try:
         if not isinstance(item, dict):
             return findings
-        repo = item.get("repository") if isinstance(item.get("repository"), dict) else {}
+        repo = _repo_object(item)
         if _is_private_repo(repo):
             return findings
+        if not isinstance(repo, dict):  # unreachable via _is_private_repo, kept explicit
+            return findings
 
-        path = item.get("path") or item.get("name") or ""
+        # A non-string path (malformed provider response) must not throw inside
+        # the config-file matcher and take every secret finding in this item
+        # down with it.
+        path = _as_text(item.get("path")) or _as_text(item.get("name"))
         repo_full_name = repo.get("full_name")
         repo_html_url = repo.get("html_url")
         source_url = item.get("html_url")
+        path_note = assess_path_authority(path)
+
+        def _apply_downgrades(
+            confidence: str, placeholder_reason: Optional[str]
+        ) -> Tuple[str, List[str]]:
+            reasons: List[str] = []
+            if placeholder_reason:
+                confidence = CONFIDENCE_LOW
+                reasons.append(placeholder_reason)
+            if path_note:
+                confidence = _CONFIDENCE_DOWNGRADE.get(confidence, CONFIDENCE_LOW)
+                reasons.append(path_note)
+            return confidence, reasons
 
         cfg_label = _match_config_file_pattern(path)
         if cfg_label:
+            cfg_confidence, cfg_reasons = _apply_downgrades(CONFIDENCE_MEDIUM, None)
             findings.append({
                 "category": CATEGORY_CONFIG_FILE,
                 "pattern_name": cfg_label,
-                "confidence": CONFIDENCE_MEDIUM,
+                "confidence": cfg_confidence,
                 "redacted_value": None,
                 "fingerprint_sha256": None,
                 "context": None,
@@ -797,6 +1184,10 @@ def extract_findings_from_code_item(item: Dict[str, Any]) -> List[Dict[str, Any]
                 "repo_html_url": repo_html_url,
                 "source_url": source_url,
                 "note": "Path-based match: file path matches a known sensitive config-file pattern.",
+                "quality_notes": cfg_reasons,
+                "target_string_in_fragment": None,
+                "fragment_truncated": False,
+                "findings_capped": False,
             })
 
         fragments: List[str] = []
@@ -806,42 +1197,49 @@ def extract_findings_from_code_item(item: Dict[str, Any]) -> List[Dict[str, Any]
                 if isinstance(tm, dict) and isinstance(tm.get("fragment"), str):
                     fragments.append(tm["fragment"])
 
+        target_lower = target.lower() if isinstance(target, str) and target else None
+
         for fragment in fragments:
-            for pat in SECRET_PATTERNS:
-                try:
-                    for m in pat["regex"].finditer(fragment):
-                        group_idx = pat["value_group"]
-                        try:
-                            value = m.group(group_idx) if group_idx else m.group(0)
-                        except IndexError:  # defensive: malformed group index
-                            continue
-                        if not value:
-                            continue
-                        note = None
-                        if pat["confidence"] != CONFIDENCE_HIGH:
-                            note = (
-                                "Generic keyword/pattern-based match; elevated false-positive risk "
-                                "(e.g. non-secret variable names). Verify manually before acting on it."
-                            )
-                        redacted_value = _redact_secret(value)
-                        findings.append({
-                            "category": pat["category"],
-                            "pattern_name": pat["name"],
-                            "confidence": pat["confidence"],
-                            "redacted_value": redacted_value,
-                            "fingerprint_sha256": _fingerprint(value),
-                            # Never persist the raw fragment: the matched secret span itself is
-                            # replaced by its already-redacted form before truncation/storage
-                            # (module docstring, input-contract decision #3).
-                            "context": _truncate(_redact_fragment(fragment, m.start(group_idx), m.end(group_idx), redacted_value)),
-                            "path": path,
-                            "repo_full_name": repo_full_name,
-                            "repo_html_url": repo_html_url,
-                            "source_url": source_url,
-                            "note": note,
-                        })
-                except Exception:
-                    continue  # one malformed pattern/fragment must not abort the rest
+            matches, spans, fragment_truncated, capped = _scan_fragment(fragment)
+            if not matches:
+                continue
+            # Every matched value in this fragment is redacted once, up front,
+            # so no finding's stored context can carry a co-located secret
+            # belonging to a different finding (input-contract decision #3).
+            safe_context = _truncate(_redact_spans(fragment[:MAX_FRAGMENT_CHARS], spans))
+            in_fragment = (target_lower in fragment.lower()) if target_lower else None
+            for match in matches:
+                pat = match["pattern"]
+                placeholder_reason = (
+                    None if pat.get("value_is_marker") else assess_placeholder(match["value"])
+                )
+                confidence, quality_notes = _apply_downgrades(pat["confidence"], placeholder_reason)
+                note = None
+                if pat["confidence"] != CONFIDENCE_HIGH:
+                    note = (
+                        "Generic keyword/pattern-based match; elevated false-positive risk "
+                        "(e.g. non-secret variable names). Verify manually before acting on it."
+                    )
+                findings.append({
+                    "category": pat["category"],
+                    "pattern_name": pat["name"],
+                    "confidence": confidence,
+                    "redacted_value": match["redacted_value"],
+                    # A pattern whose match is a constant marker (a PEM armour
+                    # header) has no secret value to fingerprint; emitting one
+                    # would make every such finding look like the same secret.
+                    "fingerprint_sha256": None if pat.get("value_is_marker") else _fingerprint(match["value"]),
+                    "context": safe_context,
+                    "path": path,
+                    "repo_full_name": repo_full_name,
+                    "repo_html_url": repo_html_url,
+                    "source_url": source_url,
+                    "note": note,
+                    "quality_notes": quality_notes,
+                    "target_string_in_fragment": in_fragment,
+                    "fragment_truncated": fragment_truncated,
+                    "findings_capped": capped,
+                })
     except Exception:
         return findings
     return findings
@@ -872,6 +1270,18 @@ def normalize_repo_item(raw: Dict[str, Any], discovered_via: str) -> Optional[Di
         "fork": bool(raw.get("fork")),
         "language": raw.get("language"),
         "stars": raw.get("stargazers_count"),
+        # Provider-supplied lifecycle/temporal state. Without it an archived
+        # repository last pushed a decade ago is indistinguishable from an
+        # actively maintained one, and every downstream consumer sees only
+        # this module's own discovery timestamp — which says when ReconHound
+        # looked, not how old the exposure is. Kept under GitHub's own field
+        # names so the provenance of each value stays obvious; absent for the
+        # repository objects embedded in /search/code items, which do not
+        # carry them.
+        "archived": raw.get("archived"),
+        "pushed_at": raw.get("pushed_at"),
+        "updated_at": raw.get("updated_at"),
+        "created_at": raw.get("created_at"),
         "discovered_via": {discovered_via},
     }
 
@@ -884,7 +1294,8 @@ def _aggregate_repo(agg: Dict[str, Dict[str, Any]], record: Optional[Dict[str, A
         agg[key] = dict(record)
     else:
         agg[key]["discovered_via"] |= record["discovered_via"]
-        for field in ("description", "language", "stars", "owner", "html_url"):
+        for field in ("description", "language", "stars", "owner", "html_url",
+                      "archived", "pushed_at", "updated_at", "created_at"):
             if not agg[key].get(field) and record.get(field):
                 agg[key][field] = record[field]
 
@@ -899,14 +1310,44 @@ def _aggregate_code_finding(
     (repo, path, category, fingerprint) so the same sighting surfaced by
     multiple dork queries is persisted once (input-contract decision #2).
     """
-    fp_key = finding.get("fingerprint_sha256") or f"path:{finding.get('path')}"
+    # A marker-only pattern (see SECRET_PATTERNS "value_is_marker") emits no
+    # fingerprint, so the sighting is keyed by its path instead. The
+    # pattern name is part of the key because two different marker patterns in
+    # the same file are two different sightings.
+    fp_key = (
+        finding.get("fingerprint_sha256")
+        or f"path:{finding.get('path')}:{finding.get('pattern_name')}"
+    )
     key = (finding.get("repo_full_name"), finding.get("path"), finding.get("category"), fp_key)
     if key not in agg:
         rec = dict(finding)
         rec["matched_via_queries"] = {query_label}
         agg[key] = rec
     else:
-        agg[key]["matched_via_queries"].add(query_label)
+        existing = agg[key]
+        existing["matched_via_queries"].add(query_label)
+        # Keep the most cautious reading of the same sighting seen twice: any
+        # query that saw a truncated fragment means part of it went uninspected,
+        # and a quality note raised by one observation still applies.
+        existing["fragment_truncated"] = bool(
+            existing.get("fragment_truncated") or finding.get("fragment_truncated")
+        )
+        existing["findings_capped"] = bool(
+            existing.get("findings_capped") or finding.get("findings_capped")
+        )
+        merged_notes = list(existing.get("quality_notes") or [])
+        for note in finding.get("quality_notes") or []:
+            if note not in merged_notes:
+                merged_notes.append(note)
+        existing["quality_notes"] = merged_notes
+        if CONFIDENCE_ORDER.get(finding.get("confidence"), 3) < CONFIDENCE_ORDER.get(
+            existing.get("confidence"), 3
+        ):
+            existing["confidence"] = finding["confidence"]
+        # "The target string was seen next to this match" only needs to be true
+        # of one observation to be a fact about the sighting.
+        if finding.get("target_string_in_fragment"):
+            existing["target_string_in_fragment"] = True
 
 
 def persist_repository_findings(
@@ -929,6 +1370,10 @@ def persist_repository_findings(
                 "fork": rec.get("fork"),
                 "language": rec.get("language"),
                 "stars": rec.get("stars"),
+                "archived": rec.get("archived"),
+                "pushed_at": rec.get("pushed_at"),
+                "updated_at": rec.get("updated_at"),
+                "created_at": rec.get("created_at"),
                 "discovered_via": discovered_via,
             },
             evidence=[
@@ -951,7 +1396,18 @@ def persist_code_findings(
     for key in sorted(agg, key=lambda k: (str(k[0]), str(k[1]), str(k[2]), str(k[3]))):
         rec = agg[key]
         matched_via = sorted(rec["matched_via_queries"])
-        confidence = CONFIDENCE_HIGH if len(matched_via) > 1 else rec["confidence"]
+        # Confidence is the detection pattern's own confidence, NOT a function
+        # of how many dorks surfaced the sighting. context.md §8 raises
+        # confidence for "multiple independent converging signals", and two
+        # dorks are not independent: DEFAULT_CODE_SEARCH_QUERIES' unqualified
+        # `"{target}"` query is a strict superset of every keyword-qualified
+        # query in the list, so any file matching `"{target}" password` matches
+        # it by construction. Escalating on that guaranteed overlap promoted
+        # essentially every MEDIUM keyword match to HIGH, and risk_engine.py's
+        # CONFIDENCE_SEVERITY_CAP then let HIGH be reported as CRITICAL — so a
+        # documentation placeholder read as a critical leaked credential.
+        # The query set is still recorded below as evidence.
+        confidence = rec["confidence"]
 
         evidence_line = (
             f"GitHub code search matched pattern '{rec['pattern_name']}' (category={rec['category']}) "
@@ -960,6 +1416,29 @@ def persist_code_findings(
         )
         if rec.get("redacted_value"):
             evidence_line += f"; matched value (redacted): {rec['redacted_value']}"
+        evidence: List[str] = [evidence_line]
+        # An assessment that lowered this finding's confidence is itself
+        # evidence, and must travel with the finding rather than being applied
+        # invisibly.
+        for quality_note in rec.get("quality_notes") or []:
+            evidence.append(f"Confidence reduced: {quality_note}")
+        if rec.get("target_string_in_fragment") is False:
+            evidence.append(
+                "Target string was not present in the inspected fragment: this sighting is "
+                "linked to the target only by the search query that surfaced the file, not by "
+                "any observed reference to the target near the match."
+            )
+        if rec.get("fragment_truncated"):
+            evidence.append(
+                "The provider fragment exceeded this module's inspection ceiling and was "
+                "truncated; the rest of it was not scanned."
+            )
+        if rec.get("findings_capped"):
+            evidence.append(
+                "The fragment produced more pattern matches than this module reports per "
+                "fragment; matches beyond that cap were not turned into findings. Every "
+                "matched value was still redacted from the stored excerpt."
+            )
 
         err = _safe_store_add(store, make_finding(
             finding_type="code_leak_exposure",
@@ -975,8 +1454,12 @@ def persist_code_findings(
                 "fingerprint_sha256": rec.get("fingerprint_sha256"),
                 "context": rec.get("context"),
                 "matched_via_queries": matched_via,
+                "quality_notes": list(rec.get("quality_notes") or []),
+                "target_string_in_fragment": rec.get("target_string_in_fragment"),
+                "fragment_truncated": bool(rec.get("fragment_truncated")),
+                "findings_capped": bool(rec.get("findings_capped")),
             },
-            evidence=[evidence_line],
+            evidence=evidence,
             confidence=confidence,
             metadata={
                 "category": rec["category"],
@@ -986,6 +1469,10 @@ def persist_code_findings(
                 "source_url": rec.get("source_url"),
                 "matched_query_count": len(matched_via),
                 "note": rec.get("note"),
+                "quality_notes": list(rec.get("quality_notes") or []),
+                "target_string_in_fragment": rec.get("target_string_in_fragment"),
+                "fragment_truncated": bool(rec.get("fragment_truncated")),
+                "findings_capped": bool(rec.get("findings_capped")),
             },
         ))
         if err:
@@ -1013,6 +1500,12 @@ def persist_no_match_findings(
                     "Negative-result-memory: absence of a GitHub code-search hit does not prove "
                     "the target has no exposed public code — GitHub's index may not yet cover a "
                     "recently-published file, or the code may live outside GitHub entirely."
+                ),
+                "scope": (
+                    "This records only that this one query returned zero results that GitHub "
+                    "reported as complete. Queries whose results were truncated, withheld or "
+                    "incomplete are reported under stats.code_queries_inconclusive instead and "
+                    "never recorded as a negative result."
                 ),
             },
         ))
@@ -1070,7 +1563,10 @@ def run_code_leak(
     code_agg: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     no_match_queries: List[Tuple[str, str]] = []
     private_repos_skipped = 0
+    items_unverifiable = 0
     queries_run = 0
+    queries_incomplete = 0
+    queries_inconclusive: List[str] = []
     queries_skipped: List[str] = []
 
     # --- Repository search (token optional) ---
@@ -1082,12 +1578,22 @@ def run_code_leak(
             r = {"status": "error", "error": str(exc), "items": [], "total_count": 0}
         summary["source_status"]["repo_search"] = {
             "status": r["status"], "error": r.get("error"), "total_count": r.get("total_count", 0),
+            "total_count_reported": r.get("total_count_reported", False),
+            "items_examined": r.get("items_examined", 0),
+            "incomplete_results": r.get("incomplete_results", False),
+            "results_truncated": r.get("results_truncated", False),
         }
         if r["status"] == "found":
             for raw in r["items"]:
                 try:
-                    if _is_private_repo(raw if isinstance(raw, dict) else {}):
-                        private_repos_skipped += 1
+                    # `raw` goes to _is_private_repo unchanged: a non-dict item
+                    # fails closed there, whereas substituting {} would read as
+                    # public and let an unverifiable result through.
+                    if _is_private_repo(raw):
+                        if isinstance(raw, dict):
+                            private_repos_skipped += 1
+                        else:
+                            items_unverifiable += 1
                         continue
                     norm = normalize_repo_item(raw, "repo_search")
                 except Exception as exc:
@@ -1105,38 +1611,107 @@ def run_code_leak(
         else:
             per_query_status: List[Dict[str, Any]] = []
             for idx, (label, template) in enumerate(queries):
-                query_str = template.format(target=target)
+                try:
+                    # Callers may override the dork list; a template carrying a
+                    # stray brace must cost that one query, not the whole run
+                    # (including every repository already discovered above,
+                    # which is not persisted until after this loop).
+                    query_str = template.format(target=target)
+                except (KeyError, IndexError, ValueError) as exc:
+                    summary["errors"].append({
+                        "stage": "code_search_query_template", "query": label,
+                        "error": f"unusable query template {template!r}: {exc}",
+                    })
+                    queries_skipped.append(label)
+                    continue
                 try:
                     r = search_github_code(query_str, token=token, timeout=timeout, per_page=per_page)
                 except Exception as exc:
                     r = {"status": "error", "error": str(exc), "items": [], "total_count": 0}
                 queries_run += 1
+                truncated = bool(r.get("results_truncated")) or bool(r.get("incomplete_results"))
+                if truncated:
+                    queries_incomplete += 1
                 per_query_status.append({
                     "label": label, "query": query_str, "status": r["status"],
+                    # Whether this query's outcome may be read as a statement
+                    # about the target at all. Only a conclusive, complete,
+                    # zero-result search becomes negative-result memory; every
+                    # other outcome (error, truncation, withheld results) is
+                    # explicitly not a conclusion.
+                    "conclusive": r["status"] in ("found", "not_found"),
                     "error": r.get("error"), "total_count": r.get("total_count", 0),
+                    "total_count_reported": r.get("total_count_reported", False),
+                    "items_examined": r.get("items_examined", 0),
+                    # GitHub's own "this search did not complete" flag. It was
+                    # previously parsed and then dropped, so a provider-truncated
+                    # search was indistinguishable from an exhaustive one.
+                    "incomplete_results": r.get("incomplete_results", False),
+                    "results_truncated": r.get("results_truncated", False),
                 })
 
                 if r["status"] == "found":
                     any_usable = False
+                    withheld = 0
                     for item in r["items"]:
                         try:
-                            repo = item.get("repository") if isinstance(item, dict) else None
-                            if _is_private_repo(repo if isinstance(repo, dict) else {}):
-                                private_repos_skipped += 1
+                            # Unchanged, so a missing/non-dict repository object
+                            # fails closed rather than being read as public.
+                            repo = _repo_object(item)
+                            if _is_private_repo(repo):
+                                withheld += 1
+                                if isinstance(repo, dict):
+                                    private_repos_skipped += 1
+                                else:
+                                    items_unverifiable += 1
                                 continue
                             any_usable = True
                             _aggregate_repo(repo_agg, normalize_repo_item(repo, "code_search"))
-                            for finding in extract_findings_from_code_item(item):
+                            for finding in extract_findings_from_code_item(item, target=target):
                                 _aggregate_code_finding(code_agg, finding, label)
                         except Exception as exc:
                             summary["errors"].append({"stage": "extract_findings", "query": label, "error": str(exc)})
+                    # Negative-result memory records "checked and not found". A
+                    # page whose every result was filtered out as private or
+                    # unverifiable, against a total_count GitHub reports as
+                    # non-zero, was not "not found" — it was not visible from
+                    # here. Recording it as a negative result would write a
+                    # false CHECK_NOT_FOUND state into surface_mapper's memory
+                    # and suppress the check elsewhere.
                     if not any_usable:
-                        no_match_queries.append((label, query_str))
+                        # Results existed and were withheld: that is not
+                        # absence, whatever total_count says.
+                        if withheld or truncated:
+                            queries_inconclusive.append(label)
+                            per_query_status[-1]["conclusive"] = False
+                            reasons = []
+                            if withheld:
+                                reasons.append(
+                                    f"{withheld} of {len(r['items'])} result(s) on the returned "
+                                    f"page were withheld (private or unverifiable repository)"
+                                )
+                            if truncated:
+                                reasons.append(
+                                    "the provider truncated the result set or reported the "
+                                    "search as incomplete"
+                                )
+                            per_query_status[-1]["inconclusive_reason"] = "; ".join(reasons)
+                        else:
+                            no_match_queries.append((label, query_str))
                 elif r["status"] == "not_found":
-                    no_match_queries.append((label, query_str))
+                    if truncated:
+                        # Zero items but the provider says the search did not
+                        # complete: inconclusive, not a clean negative.
+                        queries_inconclusive.append(label)
+                        per_query_status[-1]["conclusive"] = False
+                        per_query_status[-1]["inconclusive_reason"] = (
+                            "provider reported incomplete_results for a search that returned no items"
+                        )
+                    else:
+                        no_match_queries.append((label, query_str))
                 elif r["status"] in ("unauthorized", "rate_limited"):
                     # Further calls will fail identically or burn the same limit — stop, don't retry blindly.
-                    queries_skipped = [lbl for lbl, _ in queries[idx + 1:]]
+                    queries_skipped.extend(lbl for lbl, _ in queries[idx + 1:])
                     summary["errors"].append({"stage": "code_search", "query": label, "error": r.get("error")})
                     break
                 else:
@@ -1180,9 +1755,27 @@ def run_code_leak(
             cat: sum(1 for r in code_agg.values() if r["category"] == cat) for cat in sorted(CATEGORIES)
         },
         "private_repos_skipped": private_repos_skipped,
+        # Items whose repository object could not be parsed, so their
+        # public/private state was never established and they were withheld.
+        "items_unverifiable_repo": items_unverifiable,
         "code_queries_run": queries_run,
         "code_queries_skipped": queries_skipped,
         "code_queries_no_match": len(no_match_queries),
+        # Queries whose result set the provider truncated or did not complete:
+        # what was inspected is a bounded sample, not the whole match set.
+        "code_queries_incomplete": queries_incomplete,
+        # Queries that yielded nothing usable for a reason other than absence.
+        # Deliberately NOT counted as no-match: "inconclusive" and "checked and
+        # not found" are different states and only the second is negative-result
+        # memory (context.md §8).
+        "code_queries_inconclusive": queries_inconclusive,
+        # The same signal as a scalar. core/orchestrator.py's _compact_stats
+        # keeps only scalar entries from a module's nested `stats`, so without
+        # this the "this run reached no conclusion" signal would not reach the
+        # execution record at all — which is precisely the signal that must not
+        # be lost. Emitted from this side rather than by changing the
+        # orchestrator's contract.
+        "code_queries_inconclusive_count": len(queries_inconclusive),
     }
     summary["finished_at"] = _now()
     return summary
