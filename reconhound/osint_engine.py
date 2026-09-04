@@ -84,6 +84,25 @@ with a confidence above LOW for individual-identity claims (employees) —
 see input-contract decision #5 below — and every inferred finding's
 metadata/evidence text says "inferred"/"probable"/"guess", never "is".
 
+That distinction is also protected against being erased by a downstream
+convention rather than only asserted in metadata. surface_mapper.py mints a
+technology ASSET on the target host for any finding whose `value` carries a
+`technology` key, which would make a keyword scraped from a job advert
+indistinguishable in the asset graph from a technology tech_fingerprint.py
+directly fingerprinted on a live host — and risk_engine.py then describes it
+as "<tech> observed on <target>". Job-posting findings therefore key the
+value `technology_mention`, keeping a hiring-intent signal a finding about
+the target rather than an asserted property of it (input-contract
+decision #7).
+
+Known limitation, not this module's to fix: risk_engine.py currently has no
+SignalRule for any `osint_engine_*` finding type, so all of them reach it
+through the generic unclassified handler at KIND_OBSERVATION/INFO — its
+evidence-class vocabulary does not yet consume this module's
+`metadata.inferred` flag. The flag itself survives ingestion intact on the
+stored observation (verified end-to-end), so the information is present for
+whenever risk_engine gains those rules; adding them belongs to that module.
+
 CREDENTIAL HANDLING (mirrors passive_intel.py/code_leak.py's established
 convention): every third-party API below is independently, optionally
 configured. A missing credential is reported as its own explicit
@@ -119,6 +138,32 @@ passive_intel.py's `passive_intel_checked_no_data` /
 code_leak.py's `code_leak_checked_no_match` precedent) rather than silence
 — absence of a hit from any one of these third-party indexes/services is
 never proof the underlying fact doesn't exist.
+
+"Checked and found nothing" is reserved for a check that actually reached a
+conclusion. A source that completed without either a result or a conclusion
+is INCONCLUSIVE — reported in `stats.sources_inconclusive` and never written
+as a negative result. The concrete case this exists for: crt.sh lists
+certificates for the domain and then every certificate fetch fails, so zero
+certificate bodies are inspected. "No emails were found in the certificates"
+would be a claim about certificates that were never read, and
+surface_mapper.py stores a negative result as a CHECK_NOT_FOUND state that
+suppresses repeated work elsewhere. Provider errors, rate limits and
+credential failures are likewise never negative results — they are reported
+on `source_status`, and counted in `stats.source_checks_failed` /
+`stats.source_checks_missing_credentials` so the distinction survives into
+core/orchestrator.py's execution record (whose `_compact_stats` keeps only
+scalar entries from a module's nested `stats`).
+
+RESULT COMPLETENESS: each Google Custom Search query fetches exactly one
+page and is never paginated, so this module never multiplies its request
+volume against the provider's quota — and what it examines is a bounded
+sample of a potentially much larger match set. That bound is reported rather
+than implied: every per-query status carries `items_examined`,
+`total_results`, `total_results_reported` (Google omitting the count is
+recorded as unknown, not as "the page is everything") and `results_truncated`.
+A batch cut short by a credential/quota failure records every query it did
+not run with status `skipped`, so a batch that stopped after one query is
+distinguishable from a batch of one.
 
 INPUT-CONTRACT DECISIONS (ambiguities resolved so implementation can
 proceed without inventing a competing asset model or an unapproved new
@@ -196,6 +241,42 @@ surface_mapper.py gap):
      a subdomain) so downstream consumers never mistake a co-hosted
      third-party domain for a target-owned asset (context.md §9, strict
      scope enforcement).
+  7. Two categories of address/mention are recognised and deliberately
+     de-weighted rather than dropped, because both were producing confident
+     claims that were simply not true:
+
+     Role/shared mailboxes (`info.support@`, `no-reply@`, `sales.team@`) have
+     exactly the shape of a `first.last` personal address. Split naively they
+     produce a named human who does not exist, and counted as evidence they
+     measure the mail-alias layout rather than the personal naming convention
+     the inference is about. `is_role_mailbox()` requires EVERY
+     dot/underscore/hyphen token to be a role word — firing on any single
+     token erased real people called steve.jobs, dev.patel or sarah.press,
+     which trades a false positive for a worse false negative. The address is
+     still persisted; only the personal-identity claim is withheld, with the
+     reason recorded.
+
+     Job-posting keyword context: "migrating away from Oracle", "legacy PHP",
+     "nice to have: Kubernetes" and recruitment-agency boilerplate are all
+     keyword hits, and the plain English words "Go" and "Spring" collide
+     outright with technology names. `assess_mention_context()` records those
+     qualifications and lowers confidence; nothing is suppressed. Context is
+     assessed per snippet rather than per keyword occurrence, so a
+     qualification attaches to every technology named in the same sentence —
+     coarse, but it under-claims rather than over-claims. Mentions are
+     deduplicated by advert URL first, because one posting syndicated to two
+     job boards (or returned twice by the provider) is one source of evidence,
+     not two — counting it twice alone was enough to carry a keyword from LOW
+     to MEDIUM.
+
+  8. Provider answers are checked, not just provider requests. HIBP's
+     `/breaches?domain=` filter is applied server-side, but the response is
+     what gets attributed to the target — and that endpoint returns its
+     ENTIRE corpus when the domain parameter is absent, ignored or dropped by
+     an intermediary. Every returned breach's own `Domain` is therefore
+     re-checked against the target; a mismatch is still persisted (it may
+     matter) but at LOW confidence with `domain_match: False` and an explicit
+     "attribution unverified" line, never silently attributed at HIGH.
 
 Every discovery is persisted immediately to <output_dir>/pending_assets.json
 via PendingAssetsStore (the same crash-safe, atomic-write store used by
@@ -302,7 +383,109 @@ TECH_KEYWORDS: Tuple[str, ...] = tuple(sorted(set([
     "Hadoop", "TensorFlow", "PyTorch",
 ])))
 
+# ---------------------------------------------------------------------------
+# Job-posting mention context (responsibility 10)
+#
+# A keyword match in a job advert is a hiring-intent signal, and the sentence
+# around it decides what kind. "Migrating away from Oracle", "legacy PHP",
+# and "nice to have: Kubernetes" are all keyword hits, but none of them is
+# evidence that the technology is in production today — and the plain-English
+# words "Go" and "Spring" collide outright with technology names ("Spring 2024
+# internship", "a real go-getter").
+#
+# Nothing is suppressed on this basis: a qualified mention is still extracted,
+# still persisted and still carries its evidence. Only its confidence is
+# lowered and the qualification recorded, because the alternative (dropping it)
+# trades a false positive for a false negative.
+# ---------------------------------------------------------------------------
+
+# Phrases that put a technology in the past or on the way out.
+_NEGATIVE_CONTEXT_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    ("migration away from this technology",
+     re.compile(r"(?i)\b(?:migrat\w*|mov\w*|transition\w*|port\w*)\s+(?:away\s+)?(?:from|off)\b")),
+    ("technology described as legacy/deprecated",
+     re.compile(r"(?i)\b(?:legacy|deprecated|end[- ]of[- ]life|eol|sunset\w*|retir\w*|decommission\w*|phas\w*\s+out)\b")),
+    ("technology described as being replaced",
+     re.compile(r"(?i)\b(?:replac\w*|rewrit\w*|refactor\w*)\s+(?:our\s+|the\s+|from\s+)?\w*\s*(?:with|to|away)\b")),
+)
+
+# Phrases that mark a technology as desirable rather than in use.
+_OPTIONAL_CONTEXT_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    ("listed as optional/nice-to-have rather than required",
+     re.compile(r"(?i)\b(?:nice[- ]to[- ]have|good[- ]to[- ]have|bonus|a\s+plus|desirable|preferred|would\s+be\s+great|familiarity\s+with)\b")),
+    ("hypothetical/aspirational phrasing",
+     re.compile(r"(?i)\b(?:if\s+you\s+(?:have|know)|willing\s+to\s+learn|eager\s+to\s+learn|exposure\s+to)\b")),
+)
+
+# Recruiting-agency boilerplate: the advert is not the target organisation's own.
+_BOILERPLATE_CONTEXT_PATTERNS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    ("recruitment-agency boilerplate rather than a first-party posting",
+     re.compile(r"(?i)\b(?:our\s+client|on\s+behalf\s+of|recruit(?:ment)?\s+(?:agency|partner|consultan\w*)|staffing\s+(?:agency|firm)|we\s+recruit\s+for)\b")),
+)
+
+# Technology names that are also ordinary English words or unrelated proper
+# nouns. A bare match on one of these carries no weight on its own.
+_AMBIGUOUS_TECH_KEYWORDS = frozenset({"go", "spring", "spark", "express", "oracle", "rails", "vue"})
+
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+# ---------------------------------------------------------------------------
+# Role / shared mailbox recognition
+#
+# A mailbox like info.support@ or no-reply@ has exactly the shape of a
+# first.last personal address, so the naming-convention classifier reads it as
+# one and the employee generator turns it into a "probable name" for a person
+# who does not exist ("No Reply", "Sales Team"). Two distinct harms follow:
+# a fabricated identity claim about a human being, and contamination of the
+# statistical convention inference with addresses that were never subject to a
+# personal-naming policy in the first place.
+#
+# These are recognised, not discarded: the mailbox is still a genuine observed
+# address and still persisted as one. Only the *personal-identity* inference
+# drawn from it is withheld, with the reason recorded.
+# ---------------------------------------------------------------------------
+
+_ROLE_MAILBOX_TOKENS = frozenset({
+    "abuse", "accounts", "admin", "administrator", "billing", "career", "careers",
+    "contact", "customerservice", "desk", "dev", "devops", "enquiries", "enquiry",
+    "feedback", "finance", "help", "helpdesk", "hello", "hr", "info", "inquiries",
+    "it", "jobs", "legal", "mail", "mailer", "marketing", "media", "newsletter",
+    "noc", "noreply", "notification", "notifications", "office", "postmaster",
+    "press", "privacy", "recruiting", "recruitment", "reply", "root", "sales",
+    "security", "service", "services", "soc", "support", "sysadmin", "team",
+    "webmaster", "welcome",
+})
+
+# Local parts that are role mailboxes as a whole even though no single token is.
+_ROLE_MAILBOX_EXACT = frozenset({"no-reply", "do-not-reply", "donotreply", "mailer-daemon"})
+
+_LOCAL_PART_SPLIT_RE = re.compile(r"[._-]+")
+
+
+def is_role_mailbox(local_part: Optional[str]) -> bool:
+    """
+    True if `local_part` looks like a shared/role mailbox rather than one
+    person's address.
+
+    EVERY dot/underscore/hyphen-delimited token must be a role word. Firing on
+    any single token was far too eager: plenty of real people are called
+    steve.jobs, dev.patel, sarah.press, mark.legal or ana.it, and withholding
+    a genuine employee's name is a false negative traded for the false positive
+    this check exists to prevent. Requiring the whole local part to be built
+    from role words keeps info.support, sales.team and help.desk while leaving
+    a real person whose name merely contains a role word alone.
+    """
+    if not local_part or not isinstance(local_part, str):
+        return False
+    lp = local_part.strip().lower()
+    if not lp:
+        return False
+    if lp in _ROLE_MAILBOX_EXACT:
+        return True
+    tokens = [t for t in _LOCAL_PART_SPLIT_RE.split(lp) if t]
+    if not tokens:
+        return False
+    return all(t in _ROLE_MAILBOX_TOKENS for t in tokens)
 
 # Finding types already written to pending_assets.json by passive_recon.py,
 # used as seed data (input-contract decision #3).
@@ -571,7 +754,12 @@ def merge_email_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     merged: Dict[str, Set[str]] = {}
     order: List[str] = []
-    for r in records:
+    for r in records or []:
+        # A non-dict record is skipped rather than raising: this is a public
+        # entry point, and one malformed element must not discard every other
+        # harvested address alongside it.
+        if not isinstance(r, dict):
+            continue
         email = (r.get("email") or "").strip().lower()
         if not email or "@" not in email:
             continue
@@ -785,23 +973,48 @@ def harvest_ct_emails(domain: str, timeout: float = DEFAULT_TIMEOUT, max_certs: 
 
     emails: Set[str] = set()
     inspected = 0
+    failed = 0
     for cid in seen_ids:
         try:
             pem_result = fetch_crtsh_certificate_pem(cid, timeout=timeout)
         except Exception:
+            failed += 1
             continue
         if pem_result["status"] != "found":
+            failed += 1
             continue
         inspected += 1
         try:
             for e in extract_emails_from_certificate_pem(pem_result["pem"], domain):
                 emails.add(e)
         except Exception:
+            failed += 1
             continue
 
+    result["certs_listed"] = len(seen_ids)
     result["certs_inspected"] = inspected
+    result["certs_failed"] = failed
     result["emails"] = sorted(emails)
-    result["status"] = "found" if emails else "not_found"
+
+    if emails:
+        result["status"] = "found"
+        return result
+
+    # crt.sh listed certificates but not one of them could actually be fetched
+    # and parsed. "No emails were found in the certificates" would be a claim
+    # about the certificates — and none were read. run_osint_engine writes a
+    # negative result into surface_mapper's check memory (CHECK_NOT_FOUND) for
+    # a not_found, so reporting this as not_found records a conclusion that was
+    # never reached.
+    if inspected == 0 and seen_ids:
+        result["status"] = "inconclusive"
+        result["error"] = (
+            f"crt.sh listed {len(seen_ids)} candidate certificate(s) for {domain} but none "
+            f"could be fetched or parsed; no certificate content was inspected"
+        )
+        return result
+
+    result["status"] = "not_found"
     return result
 
 
@@ -863,7 +1076,11 @@ def query_google_custom_search(
              "invalid_query"|"forbidden"|"rate_limited"|"error",
              "items": [...], "total_results": int, "error": str|None}.
     """
-    result: Dict[str, Any] = {"status": "error", "items": [], "total_results": 0, "error": None}
+    result: Dict[str, Any] = {
+        "status": "error", "items": [], "total_results": 0,
+        "total_results_reported": False, "items_examined": 0,
+        "results_truncated": False, "error": None,
+    }
 
     if not query or not query.strip():
         result["error"] = "query is required"
@@ -920,11 +1137,23 @@ def query_google_custom_search(
         return result
 
     result["items"] = items
+    result["items_examined"] = len(items)
     search_info = data.get("searchInformation") if isinstance(data.get("searchInformation"), dict) else {}
+    raw_total = search_info.get("totalResults")
     try:
-        result["total_results"] = int(search_info.get("totalResults") or 0)
+        result["total_results"] = int(raw_total)
+        result["total_results_reported"] = True
     except (TypeError, ValueError):
         result["total_results"] = len(items)
+        result["total_results_reported"] = False
+    # This module requests a single page per query and never paginates, so it
+    # never multiplies its request volume against the provider's quota. What it
+    # examines is therefore a bounded sample whenever Google reports more
+    # matches than the page it returned, and saying so is the difference
+    # between "searched" and "searched as far as one page reaches".
+    result["results_truncated"] = bool(
+        result["total_results_reported"] and result["total_results"] > len(items)
+    )
     result["status"] = "found" if items else "not_found"
     return result
 
@@ -943,11 +1172,15 @@ def _run_query_batch(
     responsibilities, all of which are "run N scoped queries, collect
     indexed results" against the same Google Custom Search provider.
 
-    Returns (per_query_status, hits, no_result_queries).
+    Returns (per_query_status, hits, no_result_queries). `status_list` gains
+    one entry per query that was NOT run after an early break, so a batch cut
+    short by a quota/credential failure is distinguishable from one where every
+    query genuinely returned nothing.
     """
     status_list: List[Dict[str, Any]] = []
     hits: List[Dict[str, Any]] = []
     no_result: List[Tuple[str, str]] = []
+    stopped_at: Optional[int] = None
 
     for idx, (label, template) in enumerate(query_templates):
         q = template.format(target=target)
@@ -959,6 +1192,12 @@ def _run_query_batch(
         status_list.append({
             "label": label, "query": q, "status": r["status"],
             "error": r.get("error"), "total_results": r.get("total_results", 0),
+            "total_results_reported": r.get("total_results_reported", False),
+            "items_examined": r.get("items_examined", 0),
+            "results_truncated": r.get("results_truncated", False),
+            # Only a completed search that returned nothing says anything about
+            # the target; every other outcome is a statement about the provider.
+            "conclusive": r["status"] in ("found", "not_found"),
         })
 
         if r["status"] == "found":
@@ -975,10 +1214,22 @@ def _run_query_batch(
         elif r["status"] in ("missing_credentials", "unauthorized", "forbidden", "rate_limited"):
             # Every remaining query in this batch would fail identically or
             # burn the same quota — stop rather than retry blindly.
+            stopped_at = idx
             break
 
         if request_delay > 0 and idx < len(query_templates) - 1:
             time.sleep(request_delay)
+
+    if stopped_at is not None:
+        # The queries after the break never ran. Leaving them out entirely made
+        # a batch that stopped after one query look identical to a batch of one.
+        for label, template in query_templates[stopped_at + 1:]:
+            status_list.append({
+                "label": label, "query": template.format(target=target), "status": "skipped",
+                "error": "not run: an earlier query in this batch failed with a credential/quota error",
+                "total_results": 0, "total_results_reported": False,
+                "items_examined": 0, "results_truncated": False, "conclusive": False,
+            })
 
     return status_list, hits, no_result
 
@@ -1083,10 +1334,25 @@ def infer_email_patterns(emails: List[str], domain: str) -> Dict[str, Any]:
     Bucket observed emails by local-part naming-pattern category and rank
     candidates by frequency (context.md's "email pattern inferred from
     observed addresses -> inferred" example).
+
+    Role/shared mailboxes are excluded from the sample. `info.support@` and
+    `sales.team@` have the exact shape of a first.last personal address, so
+    counting them measures the mail-alias layout rather than the personal
+    naming convention this inference is about — three role mailboxes alone
+    were enough to carry a bogus convention to MEDIUM/HIGH confidence. They
+    are reported in `role_mailboxes_excluded`, never silently dropped.
     """
     buckets: Dict[str, Dict[str, Any]] = {}
-    for email in emails:
+    considered: List[str] = []
+    excluded: List[str] = []
+    for email in emails or []:
+        if not isinstance(email, str) or "@" not in email:
+            continue
         local = email.split("@")[0]
+        if is_role_mailbox(local):
+            excluded.append(email)
+            continue
+        considered.append(email)
         cls = classify_local_part(local)
         cat = cls["category"]
         b = buckets.setdefault(cat, {"category": cat, "count": 0, "examples": []})
@@ -1094,12 +1360,17 @@ def infer_email_patterns(emails: List[str], domain: str) -> Dict[str, Any]:
         if len(b["examples"]) < 3:
             b["examples"].append(email)
 
-    total = len(emails)
+    total = len(considered)
     candidates = sorted(buckets.values(), key=lambda b: (-b["count"], b["category"]))
     for c in candidates:
         c["share"] = round(c["count"] / total, 3) if total else 0.0
 
-    return {"total_observed": total, "candidates": candidates}
+    return {
+        "total_observed": total,
+        "candidates": candidates,
+        "role_mailboxes_excluded": sorted(excluded),
+        "total_emails_seen": len(emails or []),
+    }
 
 
 def _pattern_confidence(count: int, share: float) -> str:
@@ -1150,13 +1421,28 @@ def persist_naming_convention_finding(
     total = pattern_info["total_observed"]
     candidates = pattern_info["candidates"]
 
+    excluded = list(pattern_info.get("role_mailboxes_excluded") or [])
     if total < 2 or not candidates:
-        value = {"status": "insufficient_data", "total_observed": total}
+        value = {
+            "status": "insufficient_data", "total_observed": total,
+            "role_mailboxes_excluded": excluded,
+        }
+        evidence = [
+            f"Only {total} personal email(s) usable for {target}; insufficient data to infer "
+            f"a reliable naming convention (need >=2)."
+        ]
+        if excluded:
+            # Without this the evidence reads "only 0 emails observed" for a
+            # target where addresses really were found — they just were not
+            # personal ones.
+            evidence.append(
+                f"{len(excluded)} observed address(es) were excluded as shared/role mailboxes "
+                f"rather than personal addresses: {', '.join(excluded)}"
+            )
         finding = make_finding(
-            "osint_engine_naming_convention", target, value,
-            [f"Only {total} email(s) observed for {target}; insufficient data to infer a reliable naming convention (need >=2)."],
+            "osint_engine_naming_convention", target, value, evidence,
             CONFIDENCE_LOW,
-            metadata={"inferred": True, "observed": False},
+            metadata={"inferred": True, "observed": False, "role_mailboxes_excluded": excluded},
         )
         return finding["value"], _safe_store_add(store, finding)
 
@@ -1165,6 +1451,7 @@ def persist_naming_convention_finding(
     value = {
         "status": "inferred", "convention": top["category"], "match_count": top["count"],
         "total_observed": total, "share": top["share"], "examples": top["examples"],
+        "role_mailboxes_excluded": excluded,
     }
     finding = make_finding(
         "osint_engine_naming_convention", target, value,
@@ -1186,10 +1473,29 @@ def persist_naming_convention_finding(
 def generate_employee_inferences(emails: List[str]) -> List[Dict[str, Any]]:
     """Derive speculative employee identity records from observed emails' local parts."""
     employees = []
-    for email in emails:
+    for email in emails or []:
+        if not isinstance(email, str) or "@" not in email:
+            continue
         local = email.split("@")[0]
         cls = classify_local_part(local)
         cat = cls["category"]
+        # A role mailbox has the shape of a personal address but belongs to no
+        # one. Splitting it produces a named human who does not exist ("No
+        # Reply", "Sales Team") — a fabricated identity claim, which is a
+        # materially worse error than declining to name the mailbox. The record
+        # is kept so the address is still visible; only the name is withheld.
+        if is_role_mailbox(local):
+            employees.append({
+                "source_email": email,
+                "local_part_category": cat,
+                "probable_name": None,
+                "role_account": True,
+                "name_withheld_reason": (
+                    "local part is a shared/role mailbox, not one person's address; no "
+                    "personal identity is inferred from it"
+                ),
+            })
+            continue
         probable_name = None
         if cat in ("first.last", "first_last", "first-last") and cls["first"] and cls["last"]:
             probable_name = f"{cls['first'].capitalize()} {cls['last'].capitalize()}"
@@ -1202,6 +1508,8 @@ def generate_employee_inferences(emails: List[str]) -> List[Dict[str, Any]]:
             "source_email": email,
             "local_part_category": cat,
             "probable_name": probable_name,
+            "role_account": False,
+            "name_withheld_reason": None,
         })
     return employees
 
@@ -1212,10 +1520,12 @@ def persist_employee_findings(
     """Persist one `osint_engine_employee` finding per speculative employee identity."""
     errors: List[str] = []
     for emp in employees:
-        note = (
-            f"probable name guess: {emp['probable_name']}" if emp["probable_name"]
-            else "local part could not be reliably split into a name"
-        )
+        if emp["probable_name"]:
+            note = f"probable name guess: {emp['probable_name']}"
+        elif emp.get("name_withheld_reason"):
+            note = emp["name_withheld_reason"]
+        else:
+            note = "local part could not be reliably split into a name"
         err = _safe_store_add(store, make_finding(
             finding_type="osint_engine_employee",
             target=target,
@@ -1223,6 +1533,7 @@ def persist_employee_findings(
                 "source_email": emp["source_email"],
                 "probable_name": emp["probable_name"],
                 "local_part_category": emp["local_part_category"],
+                "role_account": bool(emp.get("role_account")),
             },
             evidence=[
                 f"Inferred from observed mailbox {emp['source_email']} using local-part "
@@ -1247,19 +1558,77 @@ def persist_employee_findings(
 # 10. Job-posting technology-stack inference
 # ---------------------------------------------------------------------------
 
+def assess_mention_context(text: str, keyword: str) -> List[str]:
+    """
+    Return the qualifications that apply to a technology keyword seen in
+    `text` — reasons the mention is weaker evidence than a plain
+    requirement. Empty list means an unqualified mention. Never raises.
+    """
+    reasons: List[str] = []
+    if not isinstance(text, str) or not text:
+        return reasons
+    for group in (_NEGATIVE_CONTEXT_PATTERNS, _OPTIONAL_CONTEXT_PATTERNS, _BOILERPLATE_CONTEXT_PATTERNS):
+        for reason, pattern in group:
+            try:
+                if pattern.search(text):
+                    reasons.append(reason)
+            except Exception:
+                continue
+    if str(keyword).strip().lower() in _AMBIGUOUS_TECH_KEYWORDS:
+        reasons.append(
+            f"'{keyword}' is also an ordinary English word or unrelated proper noun; a bare "
+            f"match in advert text does not distinguish the technology from that other sense"
+        )
+    return reasons
+
+
 def infer_tech_from_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Scan job-posting search-hit title/snippet text for known technology keyword mentions."""
+    """
+    Scan job-posting search-hit title/snippet text for known technology
+    keyword mentions.
+
+    Hits are deduplicated by URL first. The same advert reaching this
+    function twice — Google returning a duplicate, or one posting syndicated
+    to two job boards — is one source of evidence, not two, and counting it
+    twice was enough on its own to carry a keyword from LOW to MEDIUM.
+    Confidence is therefore driven by how many *distinct adverts* mention the
+    technology, and each mention's surrounding context is assessed (see
+    `assess_mention_context`) rather than treated as a flat requirement.
+    """
     agg: Dict[str, Dict[str, Any]] = {}
-    for h in hits:
+    seen_links: Set[Any] = set()
+    for h in hits or []:
+        if not isinstance(h, dict):
+            continue
         text = " ".join(filter(None, [h.get("title"), h.get("snippet")]))
         if not text:
             continue
+        # A hit with no URL still has to be deduplicated on something, or three
+        # copies of the same advert without a link count as three adverts and
+        # carry the keyword to MEDIUM on repetition alone.
+        dedupe_key = h.get("link") or ("text:" + text)
+        if dedupe_key in seen_links:
+            continue
+        seen_links.add(dedupe_key)
         for kw in TECH_KEYWORDS:
             if re.search(r"(?<![A-Za-z0-9])" + re.escape(kw) + r"(?![A-Za-z0-9])", text, re.IGNORECASE):
-                rec = agg.setdefault(kw, {"keyword": kw, "count": 0, "examples": []})
+                rec = agg.setdefault(kw, {
+                    "keyword": kw, "count": 0, "examples": [],
+                    "qualified_mentions": 0, "qualifications": [],
+                })
                 rec["count"] += 1
+                reasons = assess_mention_context(text, kw)
+                if reasons:
+                    rec["qualified_mentions"] += 1
+                    for reason in reasons:
+                        if reason not in rec["qualifications"]:
+                            rec["qualifications"].append(reason)
                 if len(rec["examples"]) < 3:
                     rec["examples"].append({"url": h.get("link"), "query_label": h.get("label")})
+    for rec in agg.values():
+        # Every mention of this keyword carried a qualification, so nothing
+        # supports it as a plain current-stack requirement.
+        rec["all_mentions_qualified"] = rec["qualified_mentions"] >= rec["count"]
     return sorted(agg.values(), key=lambda r: (-r["count"], r["keyword"]))
 
 
@@ -1269,15 +1638,41 @@ def persist_job_tech_findings(
     """Persist one `osint_engine_job_tech_inference` finding per matched technology keyword."""
     errors: List[str] = []
     for rec in agg:
+        qualifications = list(rec.get("qualifications") or [])
         confidence = CONFIDENCE_MEDIUM if rec["count"] >= 2 else CONFIDENCE_LOW
+        if rec.get("all_mentions_qualified") and qualifications:
+            confidence = CONFIDENCE_LOW
+        evidence = [
+            f"Keyword '{rec['keyword']}' appeared in {rec['count']} distinct job-posting "
+            f"search result(s) for {target}"
+        ]
+        for reason in qualifications:
+            evidence.append(f"Confidence reduced: {reason}")
         err = _safe_store_add(store, make_finding(
             finding_type="osint_engine_job_tech_inference",
             target=target,
-            value={"technology": rec["keyword"], "mention_count": rec["count"], "examples": rec["examples"]},
-            evidence=[f"Keyword '{rec['keyword']}' appeared in {rec['count']} job-posting search result(s) for {target}"],
+            # Deliberately NOT keyed "technology": surface_mapper.py mints a
+            # technology ASSET on the target host for any finding whose value
+            # carries that key, which would make a keyword scraped from a job
+            # advert indistinguishable in the asset graph from a technology
+            # tech_fingerprint.py directly fingerprinted on a live host — and
+            # risk_engine.py then reports it as "<tech> observed on <target>".
+            # A hiring-intent signal is not an observation of the running
+            # stack, so it is named for what it is and stays a finding on the
+            # target rather than becoming an asserted technology asset.
+            value={
+                "technology_mention": rec["keyword"],
+                "mention_count": rec["count"],
+                "qualified_mention_count": rec.get("qualified_mentions", 0),
+                "qualifications": qualifications,
+                "examples": rec["examples"],
+            },
+            evidence=evidence,
             confidence=confidence,
             metadata={
                 "inferred": True, "observed": False,
+                "technology_mention": rec["keyword"],
+                "qualifications": qualifications,
                 "note": "Technology mention in a public job posting is a hiring-intent signal, not confirmed current production usage.",
             },
         ))
@@ -1429,18 +1824,43 @@ def persist_breach_domain_findings(
         if not isinstance(b, dict):
             continue
         name = b.get("Name") or b.get("Title")
+        breach_domain = b.get("Domain")
+        # The request asks HIBP to filter by domain, but the answer is what
+        # gets attributed to the target, so the answer is what gets checked.
+        # HIBP's /breaches endpoint returns its ENTIRE corpus when the domain
+        # parameter is absent, ignored, or dropped by an intermediary — which
+        # would silently attribute every breach in the database to this target
+        # at HIGH confidence. A mismatch is reported, not assumed away.
+        domain_match = bool(breach_domain) and is_in_scope(str(breach_domain), target)
+        evidence = [
+            f"HIBP records a breach named '{name}' associated with domain {breach_domain!r} "
+            f"(breach date {b.get('BreachDate')})"
+        ]
+        if not domain_match:
+            evidence.append(
+                f"Attribution unverified: HIBP returned this record for a domain query on "
+                f"{target!r}, but the breach's own domain is {breach_domain!r}, which is "
+                f"neither the target nor a subdomain of it. Recorded for review rather than "
+                f"attributed to the target."
+            )
         err = _safe_store_add(store, make_finding(
             finding_type="osint_engine_breach_domain",
             target=target,
             value={
-                "name": name, "title": b.get("Title"), "domain": b.get("Domain"),
+                "name": name, "title": b.get("Title"), "domain": breach_domain,
                 "breach_date": b.get("BreachDate"), "pwn_count": b.get("PwnCount"),
                 "data_classes": b.get("DataClasses"), "is_verified": b.get("IsVerified"),
+                # Temporal provenance: when the breach happened, when HIBP
+                # learned of it, and (via the finding's own timestamp) when
+                # ReconHound observed it are three different dates.
+                "added_date": b.get("AddedDate"), "modified_date": b.get("ModifiedDate"),
+                "domain_match": domain_match,
             },
-            evidence=[f"HIBP records a breach named '{name}' associated with domain {b.get('Domain')!r} (breach date {b.get('BreachDate')})"],
-            confidence=CONFIDENCE_HIGH,
+            evidence=evidence,
+            confidence=CONFIDENCE_HIGH if domain_match else CONFIDENCE_LOW,
             metadata={
                 "observed": True, "inferred": False, "source": "hibp",
+                "domain_match": domain_match,
                 "note": "Reflects a historical breach HIBP associates with the organization's domain; does not confirm any specific account credential is currently valid.",
             },
         ))
@@ -1466,6 +1886,7 @@ def persist_breach_account_findings(
             value={
                 "email": email, "breach_name": name, "breach_date": b.get("BreachDate"),
                 "data_classes": data_classes, "is_verified": b.get("IsVerified"),
+                "added_date": b.get("AddedDate"), "modified_date": b.get("ModifiedDate"),
             },
             evidence=[f"HIBP records that {email} appears in the '{name}' breach (data classes: {', '.join(data_classes)})"],
             confidence=CONFIDENCE_HIGH,
@@ -1617,7 +2038,7 @@ def query_hackertarget_reverse_ip(
     returned as plain-text bodies with HTTP 200, so the response text is
     inspected for known markers rather than relying on status codes alone.
     """
-    result: Dict[str, Any] = {"status": "error", "domains": [], "error": None}
+    result: Dict[str, Any] = {"status": "error", "domains": [], "unparsed_lines": [], "error": None}
 
     normalized_ip = _valid_ip(ip)
     if normalized_ip is None:
@@ -1656,26 +2077,59 @@ def query_hackertarget_reverse_ip(
         return result
 
     text = (resp.text or "").strip()
-    lower = text.lower()
-
     if not text:
         result["status"] = "not_found"
         return result
-    if "api count exceeded" in lower or "quota" in lower:
-        result["status"] = "rate_limited"
-        result["error"] = text
-        return result
-    if lower.startswith("error"):
-        result["status"] = "error"
-        result["error"] = text
-        return result
-    if lower.startswith("no ") or "no records found" in lower or "no dns a records" in lower:
-        result["status"] = "not_found"
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    # HackerTarget signals errors and quota exhaustion as a plain-text body
+    # with HTTP 200, always as a single line. Scanning the WHOLE body for
+    # those markers made a legitimately co-hosted domain that merely contains
+    # one of them (quota-manager.example.com) discard the entire result set as
+    # a rate limit, losing every real domain alongside it — so the markers are
+    # only consulted for a body that is actually shaped like a status message.
+    if len(lines) == 1 and not _DOMAIN_RE.match(lines[0].rstrip(".").lower()):
+        # Hostname-shaped first: a real co-hosted domain such as
+        # error-tracking.example.com or quota-service.example.com otherwise
+        # trips the "error"/"quota" markers and the whole lookup is discarded
+        # as a provider failure.
+        lower = lines[0].lower()
+        if "api count exceeded" in lower or "quota" in lower:
+            result["status"] = "rate_limited"
+            result["error"] = text
+            return result
+        if lower.startswith("error"):
+            result["status"] = "error"
+            result["error"] = text
+            return result
+        if lower.startswith("no ") or "no records found" in lower or "no dns a records" in lower:
+            result["status"] = "not_found"
+            return result
+
+    # Each line is supposed to be a hostname. An unrecognised provider message
+    # ("Invalid input.", "Please upgrade your plan") is not one, and persisting
+    # it would put a sentence into the asset graph as a co-hosted domain.
+    domains: List[str] = []
+    unparsed: List[str] = []
+    for line in lines:
+        candidate = line.rstrip(".").lower()
+        if _DOMAIN_RE.match(candidate):
+            domains.append(candidate)
+        else:
+            unparsed.append(line)
+
+    result["unparsed_lines"] = unparsed
+    if domains:
+        result["domains"] = domains
+        result["status"] = "found"
         return result
 
-    domains = [line.strip() for line in text.splitlines() if line.strip()]
-    result["domains"] = domains
-    result["status"] = "found" if domains else "not_found"
+    # Non-empty body, nothing hostname-shaped in it: the provider said
+    # something this module does not understand. That is an unusable response,
+    # not evidence that no domain is co-hosted on the IP.
+    result["status"] = "error"
+    result["error"] = f"HackerTarget returned no hostname-shaped lines: {_truncate(text, 200)!r}"
     return result
 
 
@@ -1904,6 +2358,7 @@ def run_osint_engine(
 
     no_result_checks: List[Tuple[str, str]] = []
     email_records: List[Dict[str, Any]] = []
+    inconclusive_sources: List[str] = []
 
     # --- 1a. CT-log email harvesting ---
     if include_ct:
@@ -1912,12 +2367,20 @@ def run_osint_engine(
         except Exception as exc:
             ct = {"status": "error", "error": str(exc), "emails": [], "certs_inspected": 0}
         summary["source_status"]["ct_log"] = {
-            "status": ct["status"], "error": ct.get("error"), "certs_inspected": ct.get("certs_inspected", 0),
+            "status": ct["status"], "error": ct.get("error"),
+            "certs_listed": ct.get("certs_listed", 0),
+            "certs_inspected": ct.get("certs_inspected", 0),
+            "certs_failed": ct.get("certs_failed", 0),
         }
         if ct["status"] == "found":
             email_records.extend({"email": e, "source": "ct_log"} for e in ct["emails"])
         elif ct["status"] == "not_found":
             no_result_checks.append(("ct_log_email_harvest", f"crt.sh CT-log inspection found no emails in certificates for {target}"))
+        elif ct["status"] == "inconclusive":
+            # Certificates were listed but none could be read. Deliberately NOT
+            # negative-result memory: nothing was inspected, so nothing was
+            # ruled out.
+            inconclusive_sources.append("ct_log")
 
     # --- 1b. Search-engine email harvesting ---
     if include_search_email:
@@ -2135,6 +2598,27 @@ def run_osint_engine(
         if nr_errors:
             summary["errors"].append({"stage": "negative_result_memory", "errors": nr_errors})
 
+    # core/orchestrator.py's _compact_stats keeps only scalar entries from a
+    # module's nested `stats`, and provider outcomes otherwise live only in the
+    # non-scalar `source_status` map — so a run in which every third-party
+    # source failed reported exactly the same execution record as a run that
+    # cleanly found nothing. These counters carry that distinction across.
+    failed_statuses = {"error", "rate_limited", "unauthorized", "forbidden", "invalid_query"}
+    # Counted per source CHECK, not per source: one batch of dork queries or
+    # one per-account HIBP sweep contributes one entry per query/account.
+    source_checks_failed = 0
+    source_checks_missing_credentials = 0
+    for key, entry in summary["source_status"].items():
+        entries = entry if isinstance(entry, list) else [entry]
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            status = e.get("status")
+            if status in failed_statuses:
+                source_checks_failed += 1
+            elif status == "missing_credentials":
+                source_checks_missing_credentials += 1
+
     summary["stats"] = {
         "emails_found": len(merged_emails),
         "employees_inferred": len(employees),
@@ -2147,6 +2631,17 @@ def run_osint_engine(
         "reverse_ip_domains_found": len(summary["reverse_ip"]),
         "asn_neighbors_found": len(summary["asn_neighbors"]),
         "no_result_checks": len(no_result_checks),
+        "source_checks_failed": source_checks_failed,
+        "source_checks_missing_credentials": source_checks_missing_credentials,
+        # Sources that completed without either a result or a conclusion.
+        # Never counted as no-result checks: "inconclusive" and "checked and
+        # found nothing" are different states and only the second is
+        # negative-result memory (context.md §8).
+        "sources_inconclusive": list(inconclusive_sources),
+        "sources_inconclusive_count": len(inconclusive_sources),
+        "role_mailboxes_excluded_from_pattern_inference": len(
+            pattern_info.get("role_mailboxes_excluded") or []
+        ),
         "seed_ip": seed["ip"],
         "seed_asn": seed["asn"],
     }

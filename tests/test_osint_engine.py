@@ -569,12 +569,32 @@ class TestHarvestSearchEngineEmails:
 class TestRunQueryBatch:
     @mock.patch("reconhound.osint_engine.requests.get")
     def test_stops_on_rate_limit(self, mock_get):
+        """
+        Strengthened from an earlier version that asserted `len(status_list) == 1`.
+        That measured "only one query ran" via the size of the status list, which
+        also meant the eleven queries that never ran were reported NOWHERE — a
+        batch cut short after one query looked identical to a batch of one. The
+        stopping behaviour is now asserted directly (one HTTP request issued),
+        and the un-run queries must be explicitly accounted for.
+        """
         mock_get.return_value = _fake_response(429)
         status_list, hits, no_res = oe._run_query_batch(
             oe.DEFAULT_DORK_QUERIES, SAFE_TARGET, "key", "cx", 5.0, 10, 0
         )
-        assert len(status_list) == 1
+        # The batch really did stop: exactly one request left the process, and
+        # the remaining quota was not burned.
+        assert mock_get.call_count == 1
         assert status_list[0]["status"] == "rate_limited"
+        assert status_list[0]["conclusive"] is False
+
+        # ...and every query it did not run is accounted for rather than absent.
+        skipped = [s for s in status_list if s["status"] == "skipped"]
+        assert len(skipped) == len(oe.DEFAULT_DORK_QUERIES) - 1
+        assert len(status_list) == len(oe.DEFAULT_DORK_QUERIES)
+        assert all(s["conclusive"] is False for s in skipped)
+        assert {s["label"] for s in skipped} == {lbl for lbl, _ in oe.DEFAULT_DORK_QUERIES[1:]}
+        # A skipped query must never look like a query that found nothing.
+        assert no_res == []
 
     @mock.patch("reconhound.osint_engine.requests.get")
     def test_collects_hits_and_no_results(self, mock_get):
@@ -986,3 +1006,629 @@ class TestRunOsintEngine:
                 include_reverse_ip=False, include_asn_neighbors=False,
             )
         json.dumps(result)
+
+
+# ===========================================================================
+# Module 4 remediation regression tests
+#
+# Each class pins one confirmed defect from the Module 4 audit. The docstrings
+# record the reproduction, because several were only visible once the finding
+# reached surface_mapper.py/risk_engine.py, and four of them are regressions
+# found by adversarially attacking the fixes themselves.
+# ===========================================================================
+
+class TestRoleMailboxesDoNotBecomePeople:
+    """
+    OE-01/OE-02. `info.support@` has exactly the shape of a first.last personal
+    address, so the employee generator turned it into a named human who does
+    not exist ("Info Support", "No Reply", "Sales Team") and the naming-
+    convention inference counted it as evidence of a personal naming policy.
+    """
+
+    ROLE_MAILBOXES = ["info.support", "no-reply", "sales.team", "help.desk",
+                      "jobs.careers", "hr.team", "it.support", "info", "support",
+                      "admin", "postmaster", "noreply", "do-not-reply"]
+
+    # Real people whose names contain a role word. An earlier version of the
+    # fix fired on ANY matching token and erased every one of them — a false
+    # negative traded for the false positive the check exists to prevent.
+    REAL_PEOPLE = ["steve.jobs", "dev.patel", "ana.it", "john.mail", "sarah.press",
+                   "mark.legal", "j.service", "tim.cook", "jane.doe"]
+
+    @pytest.mark.parametrize("local_part", ROLE_MAILBOXES)
+    def test_recognises_role_mailboxes(self, local_part):
+        assert oe.is_role_mailbox(local_part) is True
+
+    @pytest.mark.parametrize("local_part", REAL_PEOPLE)
+    def test_does_not_erase_real_people(self, local_part):
+        assert oe.is_role_mailbox(local_part) is False
+
+    @pytest.mark.parametrize("value", [None, "", "   ", 123, [], {}, "...", "---", "\x00"])
+    def test_malformed_input_is_safe(self, value):
+        assert oe.is_role_mailbox(value) is False
+
+    def test_role_mailbox_yields_no_fabricated_name(self):
+        emps = oe.generate_employee_inferences(["sales.team@example.com"])
+        assert emps[0]["probable_name"] is None
+        assert emps[0]["role_account"] is True
+        assert "role mailbox" in emps[0]["name_withheld_reason"]
+
+    def test_real_person_still_gets_a_probable_name(self):
+        emps = oe.generate_employee_inferences(["steve.jobs@example.com"])
+        assert emps[0]["probable_name"] == "Steve Jobs"
+        assert emps[0]["role_account"] is False
+
+    def test_role_mailbox_is_still_recorded_not_dropped(self, tmp_path):
+        """The address is real; only the personal-identity claim is withheld."""
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        emps = oe.generate_employee_inferences(["sales.team@example.com"])
+        assert oe.persist_employee_findings(emps, SAFE_TARGET, store) == []
+        rec = store.all()[0]
+        assert rec["value"]["source_email"] == "sales.team@example.com"
+        assert rec["value"]["probable_name"] is None
+        assert rec["value"]["role_account"] is True
+        assert rec["confidence"] == oe.CONFIDENCE_LOW
+
+    def test_role_mailboxes_excluded_from_naming_convention_sample(self):
+        info = oe.infer_email_patterns(
+            ["info.support@example.com", "sales.team@example.com", "john.smith@example.com"],
+            SAFE_TARGET)
+        assert info["total_observed"] == 1
+        assert info["total_emails_seen"] == 3
+        assert info["role_mailboxes_excluded"] == ["info.support@example.com", "sales.team@example.com"]
+
+    def test_three_role_mailboxes_no_longer_carry_a_bogus_convention(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        info = oe.infer_email_patterns(
+            ["info.support@example.com", "sales.team@example.com", "help.desk@example.com"], SAFE_TARGET)
+        value, err = oe.persist_naming_convention_finding(info, SAFE_TARGET, store)
+        assert err is None
+        assert value["status"] == "insufficient_data"
+        # The excluded addresses are named, so "0 usable" is not mistaken for
+        # "no addresses were found".
+        assert len(value["role_mailboxes_excluded"]) == 3
+        assert any("excluded as shared/role mailboxes" in e for e in store.all()[0]["evidence"])
+
+    def test_personal_addresses_still_reach_high_confidence(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        info = oe.infer_email_patterns(
+            ["john.smith@example.com", "jane.doe@example.com", "bob.jones@example.com"], SAFE_TARGET)
+        value, _ = oe.persist_naming_convention_finding(info, SAFE_TARGET, store)
+        assert value["convention"] == "first.last"
+        assert store.all()[0]["confidence"] == oe.CONFIDENCE_HIGH
+
+
+class TestJobPostingMentionContext:
+    """
+    OE-03/OE-04. Keyword matching had no notion of the sentence around it, so
+    "migrating away from Oracle", "legacy PHP", "nice to have: Kubernetes",
+    agency boilerplate and the plain English words "Go"/"Spring" all counted as
+    plain technology requirements — and a duplicate hit alone was enough to
+    carry a keyword from LOW to MEDIUM.
+    """
+
+    @pytest.mark.parametrize("text,expect", [
+        ("We are migrating away from Oracle to PostgreSQL", "migration away"),
+        ("Maintain our legacy PHP system", "legacy/deprecated"),
+        ("This service is being decommissioned", "legacy/deprecated"),
+        ("Nice to have: Kubernetes", "optional/nice-to-have"),
+        ("Terraform would be great", "optional/nice-to-have"),
+        ("If you have Kafka experience", "hypothetical/aspirational"),
+        ("Our client is a leading retailer", "recruitment-agency boilerplate"),
+    ])
+    def test_flags_qualified_context(self, text, expect):
+        reasons = " ".join(oe.assess_mention_context(text, "Python"))
+        assert expect in reasons
+
+    def test_plain_requirement_is_not_qualified(self):
+        assert oe.assess_mention_context("Required: 5 years of Python in production", "Python") == []
+
+    @pytest.mark.parametrize("keyword", ["Go", "Spring", "Spark", "Express", "Oracle"])
+    def test_ambiguous_keywords_are_flagged(self, keyword):
+        reasons = oe.assess_mention_context("Backend engineer wanted", keyword)
+        assert any("ordinary English word" in r for r in reasons)
+
+    @pytest.mark.parametrize("keyword", ["Python", "Kubernetes", "PostgreSQL", "TypeScript"])
+    def test_unambiguous_keywords_are_not_flagged(self, keyword):
+        assert oe.assess_mention_context("Backend engineer wanted", keyword) == []
+
+    @pytest.mark.parametrize("text", [None, "", 123, [], {}, b"bytes", "\x00"])
+    def test_malformed_text_is_safe(self, text):
+        assert oe.assess_mention_context(text, "Python") == []
+
+    @pytest.mark.parametrize("keyword", [None, 123, "", []])
+    def test_malformed_keyword_is_safe(self, keyword):
+        assert oe.assess_mention_context("some text", keyword) == []
+
+    def test_spring_2024_internship_is_qualified_not_a_stack_claim(self, tmp_path):
+        hits = [{"title": "Spring 2024 Internship", "snippet": "Apply now!",
+                 "link": "https://indeed.com/j/1", "label": "job_indeed"}]
+        agg = oe.infer_tech_from_hits(hits)
+        rec = [r for r in agg if r["keyword"] == "Spring"][0]
+        assert rec["all_mentions_qualified"] is True
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        assert oe.persist_job_tech_findings(agg, SAFE_TARGET, store) == []
+        persisted = store.all()[0]
+        assert persisted["confidence"] == oe.CONFIDENCE_LOW
+        assert any("Confidence reduced" in e for e in persisted["evidence"])
+        # Nothing is suppressed: the mention and its examples survive intact.
+        assert persisted["value"]["technology_mention"] == "Spring"
+        assert persisted["value"]["examples"]
+
+    def test_duplicate_url_no_longer_inflates_the_count(self, tmp_path):
+        hit = {"title": "Backend", "snippet": "Kubernetes in production",
+               "link": "https://indeed.com/j/1", "label": "job_indeed"}
+        agg = oe.infer_tech_from_hits([hit, dict(hit), dict(hit)])
+        assert [r["count"] for r in agg] == [1]
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_job_tech_findings(agg, SAFE_TARGET, store)
+        assert store.all()[0]["confidence"] == oe.CONFIDENCE_LOW
+
+    def test_linkless_duplicates_are_also_deduplicated(self):
+        """Regression: dedupe originally keyed on `link`, so link-less hits escaped it."""
+        hit = {"title": "Backend", "snippet": "Kubernetes in production", "link": None, "label": "l"}
+        agg = oe.infer_tech_from_hits([hit, dict(hit), dict(hit)])
+        assert [r["count"] for r in agg] == [1]
+
+    def test_two_genuinely_distinct_adverts_still_corroborate(self):
+        """The dedupe must not cost real corroboration."""
+        agg = oe.infer_tech_from_hits([
+            {"title": "Backend", "snippet": "Kubernetes required", "link": "https://indeed.com/1", "label": "a"},
+            {"title": "SRE", "snippet": "Kubernetes required", "link": "https://lever.co/2", "label": "b"},
+        ])
+        assert agg[0]["count"] == 2
+        assert agg[0]["all_mentions_qualified"] is False
+
+    def test_unqualified_multi_advert_mention_keeps_medium(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        agg = oe.infer_tech_from_hits([
+            {"title": "Backend", "snippet": "Kubernetes required", "link": "https://indeed.com/1", "label": "a"},
+            {"title": "SRE", "snippet": "Kubernetes required", "link": "https://lever.co/2", "label": "b"},
+        ])
+        oe.persist_job_tech_findings(agg, SAFE_TARGET, store)
+        assert store.all()[0]["confidence"] == oe.CONFIDENCE_MEDIUM
+
+
+class TestJobTechIsNotATechnologyAssertion:
+    """
+    OE-09. surface_mapper.py mints a technology ASSET on the target host for any
+    finding whose `value` carries a "technology" key. A keyword scraped from a
+    job advert therefore became indistinguishable in the asset graph from a
+    technology tech_fingerprint.py had fingerprinted on a live host, and
+    risk_engine.py reported it as "<tech> observed on <target>" — the exact
+    inferred-becomes-observed collapse the module is meant to prevent.
+    """
+
+    def test_value_does_not_use_the_reserved_technology_key(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        agg = oe.infer_tech_from_hits([
+            {"title": "Backend", "snippet": "Kubernetes required", "link": "u1", "label": "a"}])
+        oe.persist_job_tech_findings(agg, SAFE_TARGET, store)
+        value = store.all()[0]["value"]
+        assert "technology" not in value
+        assert value["technology_mention"] == "Kubernetes"
+
+    def test_surface_mapper_mints_no_technology_asset(self, tmp_path):
+        from reconhound.surface_mapper import SurfaceMapper
+        out = str(tmp_path / "output")
+        store = oe.PendingAssetsStore(output_dir=out)
+        agg = oe.infer_tech_from_hits([
+            {"title": "Backend", "snippet": "Kubernetes required", "link": "u1", "label": "a"}])
+        oe.persist_job_tech_findings(agg, SAFE_TARGET, store)
+        mapper = SurfaceMapper(SAFE_TARGET, output_dir=out, autosave=True)
+        mapper.ingest_pending_assets_file()
+        asset_types = {a["asset_type"] for a in mapper.state["assets"].values()}
+        assert "technology" not in asset_types
+        # The intelligence itself is not lost — it is still a finding.
+        findings = [a for a in mapper.state["assets"].values() if a["asset_type"] == "finding"]
+        assert any(f["value"]["finding_type"] == "osint_engine_job_tech_inference" for f in findings)
+
+    def test_risk_engine_no_longer_calls_it_an_observed_technology(self, tmp_path):
+        from reconhound.surface_mapper import SurfaceMapper
+        from reconhound import risk_engine
+        out = str(tmp_path / "output")
+        store = oe.PendingAssetsStore(output_dir=out)
+        agg = oe.infer_tech_from_hits([
+            {"title": "Spring 2024 Internship", "snippet": "apply", "link": "u1", "label": "a"}])
+        oe.persist_job_tech_findings(agg, SAFE_TARGET, store)
+        mapper = SurfaceMapper(SAFE_TARGET, output_dir=out, autosave=True)
+        mapper.ingest_pending_assets_file()
+        result = risk_engine.run_risk_engine(graph=mapper, output_dir=out, persist=False)
+        assert result["errors"] == []
+        assert not any(s["category"] == "technology_observation" for s in result["signals"])
+
+
+class TestBreachAttributionIsVerified:
+    """
+    OE-05. `persist_breach_domain_findings` trusted HIBP's server-side domain
+    filter without ever checking the answer. HIBP's /breaches endpoint returns
+    its ENTIRE corpus when the domain parameter is absent, ignored, or dropped
+    by an intermediary — which silently attributed every breach in the database
+    to the target at HIGH confidence with `observed: True`.
+    """
+
+    UNRELATED = [
+        {"Name": "Adobe", "Title": "Adobe", "Domain": "adobe.com", "BreachDate": "2013-10-04",
+         "PwnCount": 152445165, "DataClasses": ["Passwords"], "IsVerified": True},
+        {"Name": "LinkedIn", "Title": "LinkedIn", "Domain": "linkedin.com", "BreachDate": "2012-05-05",
+         "PwnCount": 164611595, "DataClasses": ["Passwords"], "IsVerified": True},
+    ]
+    MATCHING = [
+        {"Name": "ExampleCorp", "Title": "Example Corp", "Domain": "example.com",
+         "BreachDate": "2019-03-01", "PwnCount": 1000, "DataClasses": ["Passwords"],
+         "IsVerified": True, "AddedDate": "2019-05-01T00:00:00Z", "ModifiedDate": "2020-01-01T00:00:00Z"},
+    ]
+
+    def test_unrelated_breach_is_not_attributed_at_high_confidence(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        assert oe.persist_breach_domain_findings(self.UNRELATED, SAFE_TARGET, store) == []
+        for rec in store.all():
+            assert rec["confidence"] == oe.CONFIDENCE_LOW
+            assert rec["value"]["domain_match"] is False
+            assert any("Attribution unverified" in e for e in rec["evidence"])
+
+    def test_unrelated_breach_is_still_recorded_for_review(self, tmp_path):
+        """Evidence-preserving: the record is kept, just not attributed."""
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_breach_domain_findings(self.UNRELATED, SAFE_TARGET, store)
+        assert {r["value"]["name"] for r in store.all()} == {"Adobe", "LinkedIn"}
+
+    def test_matching_breach_keeps_high_confidence(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_breach_domain_findings(self.MATCHING, SAFE_TARGET, store)
+        rec = store.all()[0]
+        assert rec["confidence"] == oe.CONFIDENCE_HIGH
+        assert rec["value"]["domain_match"] is True
+        assert not any("Attribution unverified" in e for e in rec["evidence"])
+
+    def test_subdomain_breach_counts_as_a_match(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_breach_domain_findings(
+            [{"Name": "Sub", "Domain": "shop.example.com", "BreachDate": "2020-01-01"}], SAFE_TARGET, store)
+        assert store.all()[0]["value"]["domain_match"] is True
+
+    @pytest.mark.parametrize("domain", [None, "", "evil-example.com", "example.com.evil.net", 123])
+    def test_missing_or_lookalike_domain_is_not_a_match(self, tmp_path, domain):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_breach_domain_findings(
+            [{"Name": "X", "Domain": domain, "BreachDate": "2020-01-01"}], SAFE_TARGET, store)
+        rec = store.all()[0]
+        assert rec["value"]["domain_match"] is False
+        assert rec["confidence"] == oe.CONFIDENCE_LOW
+
+    def test_temporal_provenance_is_preserved(self, tmp_path):
+        """OE-12: breach date, HIBP's added date and the observation date are three dates."""
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_breach_domain_findings(self.MATCHING, SAFE_TARGET, store)
+        rec = store.all()[0]
+        assert rec["value"]["breach_date"] == "2019-03-01"
+        assert rec["value"]["added_date"] == "2019-05-01T00:00:00Z"
+        assert rec["value"]["modified_date"] == "2020-01-01T00:00:00Z"
+        assert rec["timestamp"] != rec["value"]["breach_date"]
+
+    def test_account_breach_keeps_temporal_provenance(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_breach_account_findings(
+            "a@example.com", "observed",
+            [{"Name": "X", "BreachDate": "2019-01-07", "AddedDate": "2019-02-01T00:00:00Z",
+              "ModifiedDate": "2019-03-01T00:00:00Z", "DataClasses": ["Passwords"]}],
+            SAFE_TARGET, store)
+        value = store.all()[0]["value"]
+        assert value["breach_date"] == "2019-01-07"
+        assert value["added_date"] == "2019-02-01T00:00:00Z"
+        # Historical breach membership, never an active-credential claim.
+        assert "never validates" in store.all()[0]["metadata"]["note"]
+
+
+class TestReverseIpBodyHandling:
+    """
+    OE-06/OE-07. HackerTarget reports errors as a plain-text body with HTTP 200.
+    The markers were searched across the WHOLE body, so one co-hosted domain
+    containing "quota" discarded every real result as a rate limit; and any
+    unrecognised provider message became a "co-hosted domain" finding.
+    """
+
+    def _query(self, text):
+        with mock.patch("reconhound.osint_engine.requests.get",
+                        return_value=_fake_response(200, text=text)):
+            return oe.query_hackertarget_reverse_ip(SAFE_IP)
+
+    def test_domain_containing_quota_no_longer_discards_the_result_set(self):
+        r = self._query("www.example.com\nquota-manager.example.com\nshop.example.com")
+        assert r["status"] == "found"
+        assert r["domains"] == ["www.example.com", "quota-manager.example.com", "shop.example.com"]
+
+    @pytest.mark.parametrize("host", ["error-tracking.example.com", "quota-service.example.com",
+                                      "no-reply.example.com", "nodes.example.com"])
+    def test_single_hostname_that_trips_a_marker_is_still_a_hostname(self, host):
+        """Regression found by attacking the fix: a one-line body IS a valid result."""
+        r = self._query(host)
+        assert r["status"] == "found"
+        assert r["domains"] == [host]
+
+    @pytest.mark.parametrize("text", ["Invalid input.", "API key invalid",
+                                      "Please upgrade your plan for more results"])
+    def test_unrecognised_provider_message_is_an_error_not_a_domain(self, text):
+        r = self._query(text)
+        assert r["status"] == "error"
+        assert r["domains"] == []
+        # Not "not_found" either: an unusable response is not evidence of absence.
+        assert r["status"] != "not_found"
+
+    def test_known_status_messages_still_classify(self):
+        assert self._query("API count exceeded - Increase Quota with Membership")["status"] == "rate_limited"
+        assert self._query("error check your search parameter")["status"] == "error"
+        assert self._query("No DNS A records found")["status"] == "not_found"
+        assert self._query("")["status"] == "not_found"
+
+    def test_mixed_body_keeps_the_parsable_hosts_and_records_the_rest(self):
+        r = self._query("www.example.com\n-- truncated --\nshop.example.com")
+        assert r["status"] == "found"
+        assert r["domains"] == ["www.example.com", "shop.example.com"]
+        assert r["unparsed_lines"] == ["-- truncated --"]
+
+    def test_out_of_scope_cohosted_domains_are_still_flagged_not_owned(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_reverse_ip_findings(["othersite.com"], SAFE_IP, SAFE_TARGET, store)
+        rec = store.all()[0]
+        assert rec["value"]["in_scope"] is False
+        assert "not part of the target's asset inventory" in rec["metadata"]["note"]
+
+
+class TestCtHarvestPartialFailureIsInconclusive:
+    """
+    OE-08. crt.sh listed certificates, every certificate fetch failed, nothing
+    was inspected — and the module reported `not_found`, which run_osint_engine
+    writes into surface_mapper's check memory as a CHECK_NOT_FOUND negative
+    result claiming "no emails in certificates". A conclusion was recorded that
+    was never reached.
+    """
+
+    def _run(self, cert_fetch_ok):
+        listing = _fake_response(200, text=json.dumps([{"id": i} for i in range(5)]))
+        def side_effect(url, params=None, timeout=None, headers=None, **kwargs):
+            if params and "d" in params:
+                if not cert_fetch_ok:
+                    raise requests.exceptions.ConnectionError("crt.sh cert fetch down")
+                return _fake_response(200, text="-----BEGIN CERTIFICATE-----\nbad\n-----END CERTIFICATE-----")
+            return listing
+        with mock.patch("reconhound.osint_engine.requests.get", side_effect=side_effect):
+            return oe.harvest_ct_emails(SAFE_TARGET)
+
+    def test_all_cert_fetches_failing_is_inconclusive(self):
+        r = self._run(cert_fetch_ok=False)
+        assert r["status"] == "inconclusive"
+        assert r["certs_listed"] == 5
+        assert r["certs_inspected"] == 0
+        assert r["certs_failed"] == 5
+        assert "none could be fetched or parsed" in r["error"]
+
+    def test_certs_inspected_with_no_emails_is_a_genuine_negative(self):
+        """The fix must not turn every empty CT result into 'inconclusive'."""
+        r = self._run(cert_fetch_ok=True)
+        assert r["status"] == "not_found"
+        assert r["certs_inspected"] == 5
+
+    def test_empty_listing_is_a_genuine_negative(self):
+        with mock.patch("reconhound.osint_engine.requests.get",
+                        return_value=_fake_response(200, text="[]")):
+            r = oe.harvest_ct_emails(SAFE_TARGET)
+        assert r["status"] == "not_found"
+
+    def test_inconclusive_never_becomes_negative_result_memory(self, tmp_path):
+        out = str(tmp_path / "output")
+        listing = _fake_response(200, text=json.dumps([{"id": i} for i in range(5)]))
+        def side_effect(url, params=None, timeout=None, headers=None, **kwargs):
+            if "crt.sh" in url:
+                if params and "d" in params:
+                    raise requests.exceptions.ConnectionError("down")
+                return listing
+            return _fake_response(500, text="")
+        with mock.patch("reconhound.osint_engine.requests.get", side_effect=side_effect), \
+             mock.patch("reconhound.osint_engine.time.sleep"):
+            summary = oe.run_osint_engine(
+                SAFE_TARGET, output_dir=out, include_dorking=False, include_paste=False,
+                include_job_tech=False, include_hibp_account=False, include_dns_history=False,
+                include_reverse_ip=False, include_asn_neighbors=False,
+                include_search_email=False, include_hibp_domain=False)
+        assert summary["source_status"]["ct_log"]["status"] == "inconclusive"
+        assert summary["stats"]["sources_inconclusive"] == ["ct_log"]
+        assert summary["stats"]["sources_inconclusive_count"] == 1
+        with open(os.path.join(out, "pending_assets.json")) as handle:
+            types = [r["type"] for r in json.load(handle)]
+        negatives = [r for r in json.load(open(os.path.join(out, "pending_assets.json")))
+                     if r["type"] == "osint_engine_checked_no_result"]
+        assert not any(n["value"]["check"] == "ct_log_email_harvest" for n in negatives)
+
+
+class TestSearchCompletenessAndSkippedQueries:
+    """OE-10/OE-11: a bounded sample and an aborted batch must both say so."""
+
+    def test_google_result_reports_completeness(self):
+        payload = {"items": [{"title": "t", "link": f"https://example.com/{i}", "snippet": "s"}
+                             for i in range(10)],
+                   "searchInformation": {"totalResults": "48300"}}
+        with mock.patch("reconhound.osint_engine.requests.get",
+                        return_value=_fake_response(200, payload)):
+            r = oe.query_google_custom_search("site:example.com", "k", "c")
+        assert r["items_examined"] == 10
+        assert r["total_results"] == 48300
+        assert r["total_results_reported"] is True
+        assert r["results_truncated"] is True
+
+    def test_complete_single_page_is_not_truncated(self):
+        payload = {"items": [{"title": "t", "link": "https://example.com/1", "snippet": "s"}],
+                   "searchInformation": {"totalResults": "1"}}
+        with mock.patch("reconhound.osint_engine.requests.get",
+                        return_value=_fake_response(200, payload)):
+            r = oe.query_google_custom_search("q", "k", "c")
+        assert r["results_truncated"] is False
+
+    @pytest.mark.parametrize("total", [None, "many", {}, []])
+    def test_unreported_total_is_not_assumed_complete_either_way(self, total):
+        payload = {"items": [{"title": "t", "link": "https://example.com/1"}],
+                   "searchInformation": {"totalResults": total}}
+        with mock.patch("reconhound.osint_engine.requests.get",
+                        return_value=_fake_response(200, payload)):
+            r = oe.query_google_custom_search("q", "k", "c")
+        assert r["total_results_reported"] is False
+        assert r["results_truncated"] is False
+
+    def test_missing_credentials_batch_records_every_skipped_query(self):
+        status_list, hits, no_res = oe._run_query_batch(
+            oe.DEFAULT_PASTE_QUERIES, SAFE_TARGET, None, None, 5.0, 10, 0)
+        assert len(status_list) == len(oe.DEFAULT_PASTE_QUERIES)
+        assert status_list[0]["status"] == "missing_credentials"
+        assert all(s["status"] == "skipped" for s in status_list[1:])
+        assert no_res == []
+
+
+class TestProviderFailureVisibility:
+    """OE-13: _compact_stats keeps only scalars, so provider outcomes needed one."""
+
+    def test_total_provider_failure_is_countable(self, tmp_path):
+        with mock.patch("reconhound.osint_engine.requests.get",
+                        side_effect=requests.exceptions.ConnectionError("down")), \
+             mock.patch("reconhound.osint_engine.time.sleep"):
+            summary = oe.run_osint_engine(
+                SAFE_TARGET, output_dir=str(tmp_path / "output"),
+                google_api_key="k", google_cse_id="c", hibp_api_key="h",
+                securitytrails_api_key="st", seed_ip=SAFE_IP, seed_asn="64500")
+        assert summary["stats"]["source_checks_failed"] > 0
+        # A total failure must not masquerade as a clean set of negatives.
+        assert summary["stats"]["no_result_checks"] == 0
+
+    def test_missing_credentials_counted_separately_from_failures(self, tmp_path):
+        with mock.patch("reconhound.osint_engine.requests.get",
+                        return_value=_fake_response(200, text="[]")), \
+             mock.patch("reconhound.osint_engine.time.sleep"):
+            summary = oe.run_osint_engine(
+                SAFE_TARGET, output_dir=str(tmp_path / "output"),
+                google_api_key=None, google_cse_id=None, hibp_api_key=None,
+                securitytrails_api_key=None, seed_ip=SAFE_IP, seed_asn="64500")
+        assert summary["stats"]["source_checks_missing_credentials"] > 0
+
+    def test_orchestrator_compact_stats_preserves_the_counters(self, tmp_path):
+        from reconhound.core.orchestrator import _compact_stats
+        with mock.patch("reconhound.osint_engine.requests.get",
+                        side_effect=requests.exceptions.ConnectionError("down")), \
+             mock.patch("reconhound.osint_engine.time.sleep"):
+            summary = oe.run_osint_engine(
+                SAFE_TARGET, output_dir=str(tmp_path / "output"), hibp_api_key="h")
+        compact = _compact_stats(summary)
+        assert compact["stats.source_checks_failed"] > 0
+        assert compact["stats.sources_inconclusive_count"] == 0
+
+
+class TestPublicEntryPointRobustness:
+    """
+    Found by adversarially fuzzing the module's public helpers. Not reachable
+    from run_osint_engine (which only ever passes well-formed collections), but
+    these are documented entry points and every other malformed-input path in
+    this module degrades rather than raising.
+    """
+
+    @pytest.mark.parametrize("hits", [None, [], [None, 1, "x", []], [{"title": None, "snippet": None}]])
+    def test_infer_tech_from_hits_never_raises(self, hits):
+        assert oe.infer_tech_from_hits(hits) == []
+
+    @pytest.mark.parametrize("records", [None, [], [None, 7, "x"], [{}], [{"email": None}], [{"email": "no-at-sign"}]])
+    def test_merge_email_records_never_raises(self, records):
+        assert oe.merge_email_records(records) == []
+
+    def test_merge_email_records_keeps_valid_entries_alongside_malformed_ones(self):
+        merged = oe.merge_email_records([None, {"email": None}, {"email": "a@example.com", "source": "ct_log"}, 7])
+        assert [m["email"] for m in merged] == ["a@example.com"]
+
+    @pytest.mark.parametrize("emails", [None, [], [None, 7, "no-at-sign"]])
+    def test_employee_inference_never_raises(self, emails):
+        assert oe.generate_employee_inferences(emails) == []
+
+    @pytest.mark.parametrize("emails", [None, [], [None, 7, "no-at-sign"]])
+    def test_infer_email_patterns_never_raises(self, emails):
+        info = oe.infer_email_patterns(emails, SAFE_TARGET)
+        assert info["total_observed"] == 0
+        assert info["candidates"] == []
+
+    def test_valid_emails_survive_alongside_malformed_ones(self):
+        emps = oe.generate_employee_inferences([None, "jane.doe@example.com", 7])
+        assert [e["probable_name"] for e in emps] == ["Jane Doe"]
+
+
+class TestInferredObservedBoundaryIsPinned:
+    """
+    The four boundary guarantees the module exists to hold (assignment §9).
+    Three of them were asserted only by a note string in the source with no
+    test behind them; this pins all four, including end-to-end through
+    surface_mapper.py.
+    """
+
+    def test_asn_adjacency_is_not_corporate_ownership(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_asn_neighbor_findings(
+            [{"asn": 174, "name": "COGENT-174", "description": "Cogent Communications",
+              "country_code": "US"}], "64500", SAFE_TARGET, store)
+        rec = store.all()[0]
+        assert rec["confidence"] == oe.CONFIDENCE_MEDIUM
+        assert "not necessarily shared organizational ownership" in rec["metadata"]["note"]
+        # The peer is described as a peer, never as an asset of the target.
+        assert "peer" in rec["evidence"][0].lower()
+        assert rec["value"]["peer_asn"] == 174
+        assert rec["value"]["source_asn"] == "64500"
+
+    def test_transit_and_cloud_peers_are_not_promoted(self, tmp_path):
+        """A transit provider or cloud ASN is the common case, not an exception."""
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_asn_neighbor_findings(
+            [{"asn": 16509, "name": "AMAZON-02", "description": "Amazon.com, Inc."},
+             {"asn": 3356, "name": "LEVEL3", "description": "Level 3 Parent, LLC"},
+             {"asn": 13335, "name": "CLOUDFLARENET", "description": "Cloudflare, Inc."}],
+            "64500", SAFE_TARGET, store)
+        assert len(store.all()) == 3
+        for rec in store.all():
+            assert rec["confidence"] != oe.CONFIDENCE_HIGH
+            assert "not necessarily shared organizational ownership" in rec["metadata"]["note"]
+
+    def test_cohosted_domain_is_not_a_target_asset(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_reverse_ip_findings(
+            ["shared-tenant.net", "mail.example.com"], SAFE_IP, SAFE_TARGET, store)
+        by_domain = {r["value"]["domain"]: r for r in store.all()}
+        assert by_domain["shared-tenant.net"]["value"]["in_scope"] is False
+        assert by_domain["mail.example.com"]["value"]["in_scope"] is True
+
+    def test_breach_membership_is_not_an_active_credential(self, tmp_path):
+        store = oe.PendingAssetsStore(output_dir=str(tmp_path))
+        oe.persist_breach_account_findings(
+            "a@example.com", "observed",
+            [{"Name": "OldBreach", "BreachDate": "2012-05-05", "DataClasses": ["Passwords"]}],
+            SAFE_TARGET, store)
+        rec = store.all()[0]
+        assert "never validates the leaked credential" in rec["metadata"]["note"]
+        assert rec["value"]["breach_date"] == "2012-05-05"
+        # No field anywhere claims the credential is live.
+        assert "active" not in json.dumps(rec).lower()
+
+    def test_inferred_flag_survives_surface_mapper_ingestion(self, tmp_path):
+        """
+        The inferred/observed split must survive correlation, not just exist in
+        this module. risk_engine.py has no SignalRule for osint_engine_* types
+        yet, so it reads them all as generic observations — that is a
+        documented downstream gap, but the flag itself must still be there for
+        it to consume.
+        """
+        from reconhound.surface_mapper import SurfaceMapper
+        out = str(tmp_path / "output")
+        store = oe.PendingAssetsStore(output_dir=out)
+        oe.persist_employee_findings(
+            oe.generate_employee_inferences(["jane.doe@example.com"]), SAFE_TARGET, store)
+        oe.persist_emails(
+            oe.merge_email_records([{"email": "a@example.com", "source": "ct_log"}]),
+            SAFE_TARGET, store)
+        mapper = SurfaceMapper(SAFE_TARGET, output_dir=out, autosave=True)
+        mapper.ingest_pending_assets_file()
+        by_type = {o["type"]: o for o in mapper.state["observations"].values()}
+        assert by_type["osint_engine_employee"]["metadata"]["inferred"] is True
+        assert by_type["osint_engine_employee"]["metadata"]["observed"] is False
+        assert by_type["osint_engine_email"]["metadata"]["observed"] is True
+        assert by_type["osint_engine_email"]["metadata"]["inferred"] is False
