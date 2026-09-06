@@ -14,6 +14,7 @@ separately by TestRealWordlists).
 
 import json
 import os
+import time
 import sys
 from unittest import mock
 
@@ -208,8 +209,23 @@ class TestClassifyResponse:
         assert dtype == "not_found"
         assert conf == ed.CONFIDENCE_HIGH
 
-    def test_200_without_baseline_is_confirmed(self):
-        dtype, conf, _ = ed.classify_response({"status_code": 200, "body": "real content"}, None)
+    def test_200_without_baseline_is_confirmed_but_capped(self):
+        # Behaviour change (deliberate): without a usable catch-all baseline
+        # there is no reference point for "what this host returns for a path
+        # that does not exist", so a soft-404 cannot be ruled out and HIGH is
+        # unearned. Previously every 200 was HIGH whenever the baseline probe
+        # had merely failed — a single timed-out probe turned an entire run's
+        # output into false HIGH-confidence discoveries.
+        dtype, conf, notes = ed.classify_response({"status_code": 200, "body": "real content"}, None)
+        assert dtype == "content_confirmed"
+        assert conf == ed.CONFIDENCE_MEDIUM
+        assert any("baseline" in n for n in notes)
+
+    def test_200_with_usable_baseline_is_high_confidence(self):
+        baseline = {"available": True, "usable": True, "status_codes": [404],
+                    "body_hashes": [ed._content_signature("nope")[1]],
+                    "structural_hashes": [], "content_lengths": [4]}
+        dtype, conf, _ = ed.classify_response({"status_code": 200, "body": "real content"}, baseline)
         assert dtype == "content_confirmed"
         assert conf == ed.CONFIDENCE_HIGH
 
@@ -226,7 +242,19 @@ class TestClassifyResponse:
         assert dtype == "content_confirmed"
 
     def test_redirect_classified(self):
+        # Confidence is capped without a baseline for the same reason as the
+        # 200 case: a blanket "everything redirects to /login" catch-all is
+        # indistinguishable from a real redirect until the root's not-found
+        # behaviour is known.
         dtype, conf, _ = ed.classify_response({"status_code": 302, "body": ""}, None)
+        assert dtype == "redirect"
+        assert conf == ed.CONFIDENCE_LOW
+
+    def test_redirect_with_baseline_is_medium(self):
+        baseline = {"available": True, "usable": True, "status_codes": [404],
+                    "body_hashes": [ed._content_signature("nope")[1]],
+                    "structural_hashes": [], "content_lengths": [4]}
+        dtype, conf, _ = ed.classify_response({"status_code": 302, "body": ""}, baseline)
         assert dtype == "redirect"
         assert conf == ed.CONFIDENCE_MEDIUM
 
@@ -651,9 +679,15 @@ class TestEnumerateDirectoriesAndFiles:
         with mock.patch("requests.get", side_effect=fake_get):
             result = ed.enumerate_directories(SAFE_URL, target=SAFE_TARGET, wordlists_dir=wl_dir)
 
-        assert len(result["endpoints"]) == 1
-        assert result["endpoints"][0]["discovery_type"] == "possible_soft_404_match"
-        assert result["endpoints"][0]["confidence"] == ed.CONFIDENCE_LOW
+        # Behaviour change (deliberate): a response matching the root's
+        # catch-all fingerprint is a NEGATIVE result, not a low-confidence
+        # discovery. Emitting one endpoint record per soft-404 meant
+        # surface_mapper minted an endpoint asset for every wordlist entry on
+        # a catch-all host, and exposure_scan then re-probed those phantom
+        # endpoints as if they were real surface. The observation is still
+        # kept — as the negative/catch-all counters, not as an asset.
+        assert result["endpoints"] == []
+        assert result["negative_results_count"] >= 1
 
     def test_missing_wordlist_reports_error_not_crash(self, tmp_path):
         empty_dir = tmp_path / "no_wordlists_here"
@@ -1086,6 +1120,1242 @@ class TestUrlHelpers:
     def test_is_directory_like(self):
         assert ed._is_directory_like("https://example.com/admin/") is True
         assert ed._is_directory_like("https://example.com/admin") is False
+
+
+# ===========================================================================
+# Hardening regression tests
+#
+# Every test below pins one defect found by auditing or adversarially
+# attacking this module, and fails against the pre-hardening implementation.
+# Each names the failure mode it prevents rather than only the code path it
+# touches, so a future change that reintroduces the behaviour is recognisable
+# from the test name alone.
+# ===========================================================================
+
+
+def _catch_all_get(status, body, *, headers=None, probe_status=None, probe_body=None):
+    """
+    fake_get in which EVERY path — the random baseline probes included —
+    answers identically, i.e. a catch-all host on which nothing exists.
+    """
+    hdrs = headers or {"Content-Type": "text/html"}
+
+    def fake_get(url, **kwargs):
+        if "reconhound-nonexistent-check" in url and probe_status is not None:
+            return _fake_response(probe_status, headers=hdrs, body=probe_body or body)
+        return _fake_response(status, headers=hdrs, body=body)
+    return fake_get
+
+
+def _wordlists(tmp_path, dirs=("admin/", "backup/", "robots.txt"), apis=("users",)):
+    d = _write_wordlist(tmp_path, "directories.txt", list(dirs))
+    _write_wordlist(tmp_path, "api_endpoints.txt", list(apis))
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Request failure != endpoint absence, and != endpoint presence
+# ---------------------------------------------------------------------------
+
+class TestFailureIsNotEvidence:
+    """
+    The module's largest false-positive source: a server that declines or
+    fails to answer produced one `endpoint_discovered` record per wordlist
+    entry, which surface_mapper turned into endpoint assets and exposure_scan
+    then re-probed as real surface.
+    """
+
+    def test_rate_limited_host_yields_no_endpoint_findings(self, tmp_path):
+        wl_dir = _wordlists(tmp_path)
+        fake = _catch_all_get(429, b"slow down", headers={"Retry-After": "120"})
+        with mock.patch("requests.get", side_effect=fake):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_workers=1)
+        assert result["endpoints"] == []
+        assert result["blocked_probes"] > 0
+        assert result["enumeration_conclusive"] is False
+
+    def test_server_error_host_yields_no_endpoint_findings(self, tmp_path):
+        wl_dir = _wordlists(tmp_path)
+        with mock.patch("requests.get", side_effect=_catch_all_get(503, b"gateway down")):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir)
+        assert result["endpoints"] == []
+        assert result["enumeration_conclusive"] is False
+
+    def test_connection_failures_are_not_negative_results(self, tmp_path):
+        wl_dir = _wordlists(tmp_path)
+
+        def fake_get(url, **kwargs):
+            raise requests.exceptions.ConnectionError("connection refused")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir)
+        assert result["endpoints"] == []
+        # A request that never got an answer says nothing about the path.
+        assert result["negative_results_count"] == 0
+        assert result["failed_probes"] > 0
+        assert result["enumeration_conclusive"] is False
+
+    def test_500_on_one_path_is_still_reported_but_uncertain(self):
+        baseline = {"available": True, "usable": True, "status_codes": [404],
+                    "body_hashes": [ed._content_signature("nope")[1]],
+                    "structural_hashes": [], "content_lengths": [4],
+                    "error_mode_statuses": []}
+        dtype, conf, notes = ed.classify_response(
+            {"status_code": 500, "body": "boom", "headers": {}}, baseline)
+        assert dtype == ed.DT_SERVER_ERROR
+        assert conf == ed.CONFIDENCE_LOW
+        assert any("uncertain" in n for n in notes)
+
+    def test_root_wide_error_mode_marks_paths_blocked_not_absent(self):
+        baseline = {"available": True, "usable": False, "error_mode_statuses": [503]}
+        dtype, conf, notes = ed.classify_response(
+            {"status_code": 503, "body": "down", "headers": {}}, baseline)
+        assert dtype == ed.DT_BLOCKED
+        assert any("not effectively tested" in n for n in notes)
+
+
+# ---------------------------------------------------------------------------
+# Catch-all / soft-404 detection
+# ---------------------------------------------------------------------------
+
+class TestCatchAllDetection:
+    def test_dynamic_path_echoing_catch_all_is_not_confirmed_content(self, tmp_path):
+        """
+        A 200 catch-all that echoes the requested path and carries a
+        per-request id differs from a single baseline sample in both hash and
+        length, so the old fixed-tolerance comparison reported it as
+        HIGH-confidence confirmed content.
+        """
+        wl_dir = _wordlists(tmp_path)
+        counter = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            counter["n"] += 1
+            path = url.split("example.com", 1)[1]
+            body = (f"<html>Sorry, {path} was not found here. "
+                    f"request-id: {counter['n']:016x}</html>").encode()
+            return _fake_response(200, headers={"Content-Type": "text/html"}, body=body)
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir)
+        assert result["endpoints"] == []
+        assert result["catch_all_matches"] > 0
+
+    def test_catch_all_redirect_to_login_is_not_a_discovery(self, tmp_path):
+        wl_dir = _wordlists(tmp_path)
+        fake = _catch_all_get(302, b"", headers={"Location": "/login"})
+        with mock.patch("requests.get", side_effect=fake):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir)
+        assert result["endpoints"] == []
+
+    def test_catch_all_401_wall_is_not_a_discovery(self, tmp_path):
+        wl_dir = _wordlists(tmp_path)
+        with mock.patch("requests.get", side_effect=_catch_all_get(401, b"auth required")):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir)
+        assert result["endpoints"] == []
+
+    def test_catch_all_does_not_recurse(self, tmp_path):
+        """Recursing into a blanket 401 re-spends the whole wordlist per level."""
+        wl_dir = _wordlists(tmp_path, dirs=[f"d{i}/" for i in range(12)], apis=["u"])
+        with mock.patch("requests.get", side_effect=_catch_all_get(401, b"auth")):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_depth=3, max_requests=100000)
+        assert result["requests_made"] < 200
+        assert result["request_budget_exhausted"] is False
+
+    def test_baseline_probe_failure_does_not_license_high_confidence(self, tmp_path):
+        wl_dir = _wordlists(tmp_path)
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                raise requests.exceptions.Timeout("probe timed out")
+            return _fake_response(200, headers={"Content-Type": "text/html"},
+                                  body=b"<html>404 - page not found</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir)
+        assert result["baseline_unavailable"] is True
+        assert result["enumeration_conclusive"] is False
+        assert all(e["confidence"] != ed.CONFIDENCE_HIGH for e in result["endpoints"])
+
+    def test_uniform_results_without_baseline_raise_a_catch_all_conflict(self, tmp_path):
+        """
+        Fallback for a root that cannot be fingerprinted at all: if nearly
+        every hit returns the same page, that is one catch-all, and the
+        contradiction is recorded rather than silently accepted.
+        """
+        wl_dir = _wordlists(tmp_path, dirs=[f"p{i}" for i in range(12)], apis=["u"])
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                raise requests.exceptions.Timeout("probe timed out")
+            return _fake_response(200, headers={"Content-Type": "text/html"},
+                                  body=b"<html>Nothing to see here</html>")
+
+        out = tmp_path / "out"
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(out), wordlists_dir=wl_dir)
+        assert result["catch_all_suspected"] is True
+        assert all(e["confidence"] == ed.CONFIDENCE_LOW for e in result["endpoints"])
+        persisted = json.loads((out / "pending_assets.json").read_text())
+        assert any(f["type"] == "endpoint_discovery_catch_all_suspected" for f in persisted)
+
+    def test_baseline_is_per_directory_root_not_per_host(self, tmp_path):
+        """An HTML 404 at / must not be used to judge a JSON catch-all under /api/."""
+        wl_dir = _wordlists(tmp_path, dirs=["api/", "admin/"], apis=["users", "orders"])
+
+        def fake_get(url, **kwargs):
+            path = url.split("example.com", 1)[1]
+            if path.startswith("/api/"):
+                if path.rstrip("/").endswith("orders"):
+                    return _fake_response(200, headers={"Content-Type": "application/json"},
+                                          body=b'{"orders":[{"id":7},{"id":8}],"total":2}')
+                return _fake_response(200, headers={"Content-Type": "application/json"},
+                                      body=b'{"error":"resource not found","code":404}')
+            if path.rstrip("/").endswith("admin"):
+                return _fake_response(200, headers={"Content-Type": "text/html"},
+                                      body=b"<html>Admin panel</html>")
+            return _fake_response(404, headers={"Content-Type": "text/html"},
+                                  body=b"<html><h1>404</h1></html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_depth=1)
+        paths = {e["path"] for e in result["endpoints"]}
+        assert "/api/orders" in paths          # real endpoint, JSON baseline differs
+        assert "/api/users" not in paths       # JSON soft-404 suppressed
+
+    def test_similar_length_alone_never_suppresses_a_discovery(self):
+        """
+        A one-byte length difference between an error envelope and a real
+        response is not evidence they are the same page; requiring content
+        overlap is what stops the suppression logic causing false negatives.
+        """
+        error_body = '{"error":"resource not found","code":404}'
+        real_body = '{"orders":[{"id":7},{"id":8}],"total":2}'
+        assert ed._lengths_close(len(error_body), len(real_body))
+        baseline = ed._probe_catch_all.__wrapped__ if False else {
+            "available": True, "usable": True, "dynamic": False,
+            "status_codes": [200], "body_hashes": [ed._content_signature(error_body)[1]],
+            "structural_hashes": [ed._structural_signature(error_body, "/api/probe")],
+            "content_lengths": [len(error_body)], "normalized_bodies": [error_body],
+        }
+        assert ed.matches_catch_all({"status_code": 200, "body": error_body, "headers": {}},
+                                    baseline, "/api/probe") is True
+        assert ed.matches_catch_all({"status_code": 200, "body": real_body, "headers": {}},
+                                    baseline, "/api/orders") is False
+
+    def test_baseline_built_from_429_or_5xx_is_not_usable(self):
+        for status in (429, 503):
+            baseline = {"available": True, "usable": False, "status_codes": [status],
+                        "error_mode_statuses": [status]}
+            assert ed.matches_catch_all(
+                {"status_code": status, "body": "", "headers": {}}, baseline, "/x") is False
+
+
+# ---------------------------------------------------------------------------
+# Scope enforcement
+# ---------------------------------------------------------------------------
+
+class TestScopeHardening:
+    @pytest.mark.parametrize("href", [
+        "http://169.254.169.254/latest/meta-data/",   # cloud instance metadata
+        "http://10.0.0.5:8080/internal",
+        "http://[::1]/admin",
+    ])
+    def test_ip_literal_links_in_page_content_are_out_of_scope(self, href):
+        body = f'<a href="{href}">x</a>'
+        assert ed.extract_link_candidates(body, SAFE_URL, target=SAFE_TARGET) == []
+
+    def test_ip_literal_link_allowed_only_when_it_is_the_target(self):
+        body = '<a href="http://203.0.113.7/x">x</a>'
+        assert ed.extract_link_candidates(body, "http://203.0.113.7/", target="203.0.113.7") == [
+            "http://203.0.113.7/x"]
+
+    def test_link_fragments_are_stripped(self):
+        links = ed.extract_link_candidates('<a href="/x#frag">a</a>', SAFE_URL, target=SAFE_TARGET)
+        assert links == ["https://example.com/x"]
+
+    def test_credentials_are_stripped_from_urls(self):
+        assert ed.validate_endpoint_target(
+            "https://admin:hunter2@example.com/x", target=SAFE_TARGET) == "https://example.com/x"
+        assert "hunter2" not in ed._normalize_url("https://admin:hunter2@example.com/x")
+        assert "hunter2" not in ed._origin_of("https://admin:hunter2@example.com/x")
+
+    @pytest.mark.parametrize("url", [
+        "https://example.com%2f@evil.com/",
+        "https://evil.com#@example.com/",
+        "https://example.com:@evil.com/",
+    ])
+    def test_userinfo_scope_confusion_is_rejected(self, url):
+        with pytest.raises(ed.ScopeError):
+            ed.validate_endpoint_target(url, target=SAFE_TARGET)
+
+    def test_idn_and_punycode_compare_equal(self):
+        assert ed._in_scope_host("xn--mnchen-3ya.de", "münchen.de") is True
+        assert ed._in_scope_host("münchen.de", "xn--mnchen-3ya.de") is True
+        assert ed._in_scope_host("evil.xn--mnchen-3ya.de.attacker.com", "münchen.de") is False
+
+    @pytest.mark.parametrize("entry", [
+        "http://evil.com/x", "//evil.com/x", "../../../etc/passwd", "..%2f..%2fetc",
+    ])
+    def test_wordlist_entries_cannot_escape_the_root(self, entry):
+        joined = ed._url_for_path("https://example.com/app/", entry)
+        assert joined.startswith("https://example.com/app/")
+
+    def test_out_of_scope_historical_records_are_skipped_not_persisted(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path / "out"))
+        result = ed.correlate_historical_parameters(
+            [], [{"url": "https://attacker.invalid/pwn", "parameters": [{"name": "q"}]},
+                 {"url": "https://ok.example.com/real"}],
+            target=SAFE_TARGET, store=store)
+        assert result["out_of_scope_skipped"] == 1
+        assert [e["url"] for e in result["endpoints"]] == ["https://ok.example.com/real"]
+        assert not any("attacker.invalid" in json.dumps(f) for f in store.all())
+
+    def test_out_of_scope_js_records_are_skipped_not_persisted(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path / "out"))
+        result = ed.correlate_javascript_parameters(
+            [], [{"url": "https://cdn.attacker.invalid/a.js"}], target=SAFE_TARGET, store=store)
+        assert result["out_of_scope_skipped"] == 1
+        assert result["endpoints"] == []
+        assert store.all() == []
+
+
+# ---------------------------------------------------------------------------
+# Correlation correctness
+# ---------------------------------------------------------------------------
+
+class TestCorrelationHostAwareness:
+    def test_historical_verification_is_host_qualified(self):
+        result = ed.correlate_historical_parameters(
+            [{"url": "https://shop.example.com/admin"}],
+            [{"url": "https://blog.example.com/admin"}],
+            target=SAFE_TARGET)
+        # The live hit was on a different subdomain; that is not verification.
+        assert result["endpoints"][0]["currently_verified"] is False
+        assert result["endpoints"][0]["confidence"] == ed.CONFIDENCE_LOW
+
+    def test_historical_verification_matches_on_the_same_host(self):
+        result = ed.correlate_historical_parameters(
+            [{"url": "https://shop.example.com/admin"}],
+            [{"url": "https://shop.example.com/admin"}],
+            target=SAFE_TARGET)
+        assert result["endpoints"][0]["currently_verified"] is True
+
+    def test_currently_verified_is_preserved_in_parameter_metadata(self):
+        finding = ed.make_parameter_finding(
+            {"name": "q", "location": "query", "historical": True, "currently_verified": True}, SAFE_TARGET)
+        assert finding["metadata"]["currently_verified"] is True
+
+
+# ---------------------------------------------------------------------------
+# Negative-result memory
+# ---------------------------------------------------------------------------
+
+class TestNegativeResultMemory:
+    def test_conclusive_empty_run_records_negative_result(self, tmp_path):
+        wl_dir = _wordlists(tmp_path)
+        out = tmp_path / "out"
+        with mock.patch("requests.get", side_effect=_all_404):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(out), wordlists_dir=wl_dir)
+        assert result["enumeration_conclusive"] is True
+        persisted = json.loads((out / "pending_assets.json").read_text())
+        assert [f["type"] for f in persisted] == ["endpoint_discovery_checked_no_endpoints"]
+
+    def test_blocked_run_never_records_negative_result(self, tmp_path):
+        """
+        The finding type contains "_checked_no", which surface_mapper trusts
+        as authoritative "checked and not found" memory. Writing it after a
+        rate-limited run would suppress a later, unblocked attempt.
+        """
+        wl_dir = _wordlists(tmp_path)
+        out = tmp_path / "out"
+        fake = _catch_all_get(429, b"slow", headers={"Retry-After": "600"},
+                              probe_status=404, probe_body=b"<html>404</html>")
+        with mock.patch("requests.get", side_effect=fake):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(out),
+                wordlists_dir=wl_dir, max_workers=1)
+        assert result["rate_limited"] is True
+        assert result["enumeration_conclusive"] is False
+        persisted = json.loads((out / "pending_assets.json").read_text()) if (
+            out / "pending_assets.json").exists() else []
+        assert not any("_checked_no" in f["type"] for f in persisted)
+
+    def test_rate_limit_tripwire_stops_a_persistently_limited_root(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=[f"d{i}/" for i in range(30)], apis=["u"])
+        fake = _catch_all_get(429, b"slow", headers={"Retry-After": "300"},
+                              probe_status=404, probe_body=b"<html>404</html>")
+        with mock.patch("requests.get", side_effect=fake):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_workers=1)
+        assert result["rate_limited"] is True
+        assert result["retry_after_seen"] == ["300"]
+        # The tripwire must stop the root, not keep hammering it.
+        assert result["requests_made"] < 30
+
+    def test_transient_rate_limiting_does_not_blind_the_rest_of_the_run(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["admin/", "backup/", "secret/"], apis=["u"])
+        state = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            state["n"] += 1
+            if state["n"] <= 2:
+                return _fake_response(429, headers={"Retry-After": "1"}, body=b"slow")
+            if url.rstrip("/").endswith("secret"):
+                return _fake_response(200, headers={"Content-Type": "text/html"},
+                                      body=b"<html>Real secret content</html>")
+            return _fake_response(404, body=b"<html>404</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_workers=1)
+        assert result["rate_limited"] is False
+        assert any("secret" in e["path"] for e in result["endpoints"])
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+class TestPersistenceHardening:
+    def test_add_many_writes_one_batch(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        findings = [ed.make_finding("endpoint_discovered", SAFE_TARGET, {"i": i}, ["e"], "LOW")
+                    for i in range(25)]
+        assert store.add_many(findings) == 25
+        assert len(store.all()) == 25
+
+    def test_add_many_empty_is_a_noop(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        assert store.add_many([]) == 0
+
+    def test_os_error_does_not_escape_and_discard_the_discovery(self, tmp_path):
+        class BrokenStore(ed.PendingAssetsStore):
+            def add_many(self, findings):
+                raise OSError(28, "No space left on device")
+
+            def add(self, finding):
+                raise OSError(28, "No space left on device")
+
+        store = BrokenStore(output_dir=str(tmp_path))
+        assert "No space left" in (ed._safe_store_add(store, {"type": "x"}) or "")
+        assert "No space left" in (ed._safe_store_add_many(store, [{"type": "x"}]) or "")
+
+    def test_unwritable_store_still_returns_the_discovery(self, tmp_path):
+        """context.md §12.11: a persistence failure must never silently drop a finding."""
+        wl_dir = _wordlists(tmp_path, dirs=["admin/"], apis=["u"])
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "pending_assets.json").write_text("{ not a json array")
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            return _fake_response(200, headers={"Content-Type": "text/html"},
+                                  body=b"<html>Real page content</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(out), wordlists_dir=wl_dir)
+        assert result["endpoints"], "discoveries were discarded because persistence failed"
+        assert all(e.get("persisted") is False for e in result["endpoints"])
+        assert any(e.get("stage") == "persistence" for e in result["errors"])
+
+    def test_unserialisable_caller_data_does_not_lose_the_batch(self, tmp_path):
+        class Weird:
+            def __repr__(self):
+                return "<weird>"
+
+        out = tmp_path / "out"
+        store = ed.PendingAssetsStore(output_dir=str(out))
+        result = ed.correlate_historical_parameters(
+            [], [{"url": "/x", "evidence": [Weird()], "parameters": [{"name": "q"}]}],
+            target=SAFE_TARGET, store=store)
+        assert result.get("errors") is None
+        assert len(store.all()) == 2
+        json.loads((out / "pending_assets.json").read_text())   # still valid JSON
+
+    def test_jsonify_handles_nan_and_cycles(self):
+        cyclic = {}
+        cyclic["self"] = cyclic
+        assert json.dumps(ed._jsonify(cyclic))
+        assert json.dumps(ed._jsonify({"n": float("nan"), "i": float("inf")}))
+
+    def test_atomic_write_fsyncs_the_directory(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        with mock.patch("os.fsync") as fsync:
+            store.add(ed.make_finding("x", SAFE_TARGET, {}, [], "LOW"))
+        assert fsync.call_count >= 2       # file + containing directory
+
+
+# ---------------------------------------------------------------------------
+# Resource bounds, cancellation and completion semantics
+# ---------------------------------------------------------------------------
+
+class TestBoundsAndCancellation:
+    def test_keyboard_interrupt_returns_a_partial_summary(self, tmp_path):
+        wl_dir = _wordlists(tmp_path)
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            raise KeyboardInterrupt()
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_workers=2)
+        assert result["status"] == "interrupted"
+        assert result["cancelled"] is True
+        assert result["enumeration_conclusive"] is False
+
+    def test_max_depth_reached_reports_actual_truncation(self, tmp_path):
+        """The old formulation could never be True on a run that truncated."""
+        wl_dir = _wordlists(tmp_path, dirs=["admin/"], apis=["u"])
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            if url.endswith("/"):
+                return _fake_response(200, headers={"Content-Type": "text/html"},
+                                      body=b"<html>a directory listing page</html>")
+            return _fake_response(404, body=b"<html>404</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_depth=1, max_requests=100000)
+        assert result["max_depth_reached"] is True
+        assert result["depth_truncated"] is True
+
+    def test_link_candidates_are_capped_per_page(self, tmp_path):
+        body = ("<html>" + "".join(
+            f'<a href="/p{i}">x</a>' for i in range(ed.DEFAULT_MAX_LINK_CANDIDATES_PER_PAGE + 500)
+        ) + "</html>").encode()
+        wl_dir = _wordlists(tmp_path, dirs=["admin/"], apis=["u"])
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            if url.endswith("/admin/"):
+                return _fake_response(200, headers={"Content-Type": "text/html"}, body=body)
+            return _fake_response(404, body=b"<html>404</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_depth=1, max_requests=100000)
+        assert any(e.get("stage") == "link_extraction" for e in result["errors"])
+
+    def test_redirect_loop_terminates(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["a"], apis=["u"])
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            if url.endswith("/a"):
+                return _fake_response(302, headers={"Location": "/b"}, body=b"")
+            if url.endswith("/b"):
+                return _fake_response(302, headers={"Location": "/a"}, body=b"")
+            return _fake_response(404, body=b"<html>404</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_depth=5, max_requests=500)
+        assert result["request_budget_exhausted"] is False
+
+    def test_baseline_probes_are_charged_to_the_request_budget(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=[f"d{i}/" for i in range(50)], apis=["u"])
+        with mock.patch("requests.get", side_effect=_all_404):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_requests=20)
+        assert result["requests_made"] <= 20 + ed.BASELINE_PROBE_COUNT
+        assert result["request_budget_exhausted"] is True
+        assert result["enumeration_conclusive"] is False
+
+    def test_oversized_body_is_bounded_without_raw_read(self):
+        payload = b"A" * (5 * 1024 * 1024)
+        response = _fake_response(200, headers={"Content-Type": "text/html"}, body=payload)
+        response.raw.read.side_effect = Exception("raw unavailable")
+        response.iter_content.return_value = iter([payload[i:i + 8192]
+                                                   for i in range(0, len(payload), 8192)])
+        with mock.patch("requests.get", return_value=response):
+            result = ed.fetch_url(SAFE_URL)
+        assert len(result["body"]) == ed.DEFAULT_MAX_BODY_BYTES
+        assert result["body_truncated"] is True
+
+    def test_cyclic_technology_structure_does_not_recurse_forever(self):
+        cyclic = {"cms": "WordPress"}
+        cyclic["self"] = cyclic
+        assert ed.select_wordlists_for_technology(cyclic) == [("wordpress_paths.txt", "wordpress")]
+
+
+# ---------------------------------------------------------------------------
+# URL canonicalisation and duplicate work
+# ---------------------------------------------------------------------------
+
+class TestCanonicalisation:
+    @pytest.mark.parametrize("a,b", [
+        ("https://example.com/admin", "https://example.com/%61dmin"),
+        ("https://example.com/a/b", "https://example.com/a/./b"),
+        ("https://example.com/a/x/../b", "https://example.com/a/b"),
+        ("https://example.com/", "https://example.com./"),
+        ("https://example.com/x#frag", "https://example.com/x"),
+        ("https://EXAMPLE.com:443/x", "https://example.com/x"),
+    ])
+    def test_equivalent_urls_normalise_together(self, a, b):
+        assert ed._normalize_url(a) == ed._normalize_url(b)
+
+    def test_encoded_slash_is_not_decoded_into_a_separator(self):
+        # %2F is a literal slash *inside* a segment; decoding it would merge
+        # two genuinely different endpoints.
+        assert ed._normalize_url("https://example.com/a%2Fb") != ed._normalize_url("https://example.com/a/b")
+
+    def test_ipv6_urls_normalise(self):
+        assert ed._normalize_url("http://[2001:DB8::1]:8080/a//b/./c") == "http://[2001:db8::1]:8080/a/b/c"
+        assert ed._normalize_url("http://[2001:db8::1]:80/x") == "http://[2001:db8::1]/x"
+
+    def test_malformed_url_does_not_raise_from_the_dedup_path(self):
+        assert ed._normalize_url("https://[not-an-ipv6/x")
+
+    def test_candidate_root_is_the_parent_directory(self):
+        assert ed._candidate_root_of("https://example.com/admin/") == "https://example.com/"
+        assert ed._candidate_root_of("https://example.com/api/v1/users") == "https://example.com/api/v1/"
+        assert ed._candidate_root_of("https://example.com/") == "https://example.com/"
+
+    def test_enumeration_root_honours_the_base_path(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["admin/"], apis=["u"])
+        seen = []
+
+        def fake_get(url, **kwargs):
+            seen.append(url)
+            return _fake_response(404, body=b"<html>404</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            ed.run_endpoint_discovery("https://example.com/app/v2/", target=SAFE_TARGET,
+                                      output_dir=str(tmp_path / "out"), wordlists_dir=wl_dir)
+        assert "https://example.com/app/v2/admin/" in seen
+        assert not any(u == "https://example.com/admin/" for u in seen)
+
+    def test_no_duplicate_endpoint_findings_for_one_url(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["admin/", "admin"], apis=["u"])
+        out = tmp_path / "out"
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            if "/admin" in url:
+                return _fake_response(200, headers={"Content-Type": "text/html"},
+                                      body=b'<html><a href="/admin/">self</a>Admin console</html>')
+            return _fake_response(404, body=b"<html>404</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            ed.run_endpoint_discovery(SAFE_URL, target=SAFE_TARGET, output_dir=str(out),
+                                      wordlists_dir=wl_dir, max_depth=2)
+        persisted = json.loads((out / "pending_assets.json").read_text())
+        urls = [f["value"]["url"] for f in persisted if f["type"] == "endpoint_discovered"]
+        assert len(urls) == len(set(urls))
+
+
+# ---------------------------------------------------------------------------
+# Parameter intelligence
+# ---------------------------------------------------------------------------
+
+class TestParameterIntelligence:
+    def test_header_hints_carry_the_endpoint_they_were_seen_on(self):
+        hints = ed.extract_header_parameter_hints(
+            "send X-Api-Key", {}, page_url="https://example.com/api/v1/users")
+        assert hints[0]["endpoint"] == "/api/v1/users"
+
+    def test_header_hints_without_a_page_url_still_work(self):
+        hints = ed.extract_header_parameter_hints("send X-Api-Key", {})
+        assert hints[0]["name"] == "X-Api-Key"
+
+    def test_form_and_link_extraction_share_one_parse(self):
+        body = '<html><form method="POST"><input name="q"></form><a href="/x">l</a></html>'
+        soup = ed._parse_soup(body)
+        assert [p["name"] for p in ed.extract_form_parameters(body, SAFE_URL, soup=soup)] == ["q"]
+        assert ed.extract_link_candidates(body, SAFE_URL, soup=soup) == ["https://example.com/x"]
+
+
+# ---------------------------------------------------------------------------
+# Downstream contract: findings must survive surface_mapper ingestion
+# ---------------------------------------------------------------------------
+
+class TestDownstreamContract:
+    def test_findings_ingest_into_surface_mapper_without_errors(self, tmp_path):
+        from reconhound import surface_mapper
+
+        wl_dir = _wordlists(tmp_path, dirs=["admin/", "robots.txt"], apis=["users"])
+        out = tmp_path / "out"
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, headers={"Content-Type": "text/html"},
+                                      body=b"<html><h1>404 Not Found</h1></html>")
+            if url.endswith("/admin/"):
+                return _fake_response(200, headers={"Content-Type": "text/html"}, body=(
+                    b'<html><form method="POST" action="/admin/login">'
+                    b'<input name="user"><input type="password" name="pw"></form></html>'))
+            return _fake_response(404, headers={"Content-Type": "text/html"},
+                                  body=b"<html><h1>404 Not Found</h1></html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(out), wordlists_dir=wl_dir,
+                historical_data=[{"url": "https://example.com/old", "parameters": [{"name": "t"}]},
+                                 {"url": "https://evil.invalid/x"}],
+                js_data=[{"url": "/admin/login", "source_file": "app.js"}])
+
+        findings = json.loads((out / "pending_assets.json").read_text())
+        required = {"type", "target", "value", "evidence", "confidence", "source",
+                    "timestamp", "metadata"}
+        assert all(required <= set(f) for f in findings)
+
+        mapper = surface_mapper.SurfaceMapper(target=SAFE_TARGET, output_dir=str(tmp_path / "sm"))
+        mapper.ingest_many(findings)
+        assert mapper.state["ingestion_errors"] == []
+        hostnames = [a["value"] for a in mapper.state["assets"].values()
+                     if a["asset_type"] == surface_mapper.ASSET_HOSTNAME]
+        assert not any("evil" in h for h in hostnames)
+        ids = [a["id"] for a in mapper.state["assets"].values()]
+        assert len(ids) == len(set(ids))
+
+
+# ---------------------------------------------------------------------------
+# Incremental persistence: the on-disk contract must be unchanged
+# ---------------------------------------------------------------------------
+
+class TestIncrementalPersistence:
+    """
+    add_many() no longer re-encodes already-written records on every append.
+    The file format, indentation and crash-safety must be indistinguishable
+    from the previous whole-array json.dump, and a writer outside this store
+    must never be silently clobbered by a stale cache.
+    """
+
+    @staticmethod
+    def _finding(i):
+        return ed.make_finding("endpoint_discovered", SAFE_TARGET,
+                               {"i": i, "url": f"https://example.com/{i}"}, [f"evidence {i}"], "HIGH")
+
+    def test_output_is_byte_identical_to_whole_array_dump(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        store.add_many([self._finding(0), self._finding(1)])
+        store.add(self._finding(2))
+        text = (tmp_path / "pending_assets.json").read_text()
+        assert text == json.dumps(json.loads(text), indent=2)
+        assert len(json.loads(text)) == 3
+
+    def test_empty_write_produces_an_empty_json_array(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        store._atomic_write([])
+        assert json.loads((tmp_path / "pending_assets.json").read_text()) == []
+
+    def test_external_writer_is_detected_and_preserved(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        store.add(self._finding(0))
+        path = tmp_path / "pending_assets.json"
+        external = json.loads(path.read_text()) + [self._finding(99)]
+        path.write_text(json.dumps(external, indent=2))
+
+        store.add(self._finding(1))
+        records = json.loads(path.read_text())
+        assert len(records) == 3
+        assert any(r["value"].get("i") == 99 for r in records)
+
+    def test_deleted_file_is_recreated_without_phantom_records(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        store.add(self._finding(0))
+        (tmp_path / "pending_assets.json").unlink()
+        store.add(self._finding(1))
+        assert len(json.loads((tmp_path / "pending_assets.json").read_text())) == 1
+
+    def test_failed_write_leaves_the_previous_file_intact_and_recovers(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        store.add(self._finding(0))
+        with mock.patch("os.replace", side_effect=OSError("disk gone")):
+            with pytest.raises(OSError):
+                store.add(self._finding(1))
+        # The rename never happened, so the file still holds only record 0 ...
+        assert len(json.loads((tmp_path / "pending_assets.json").read_text())) == 1
+        # ... and the cached prefix must not still claim record 1 was written.
+        assert store._serialized is None
+        store.add(self._finding(2))
+        records = json.loads((tmp_path / "pending_assets.json").read_text())
+        assert [r["value"]["i"] for r in records] == [0, 2]
+
+    def test_post_rename_failure_does_not_duplicate_or_lose_records(self, tmp_path):
+        """
+        _fsync_dir runs after os.replace, so a failure there means the data IS
+        on disk. Recovery must reconcile against the file, not against a stale
+        in-memory prefix that would double-write or drop the record.
+        """
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        store.add(self._finding(0))
+        with mock.patch.object(ed.PendingAssetsStore, "_fsync_dir", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                store.add(self._finding(1))
+        assert store._serialized is None
+        store.add(self._finding(2))
+        records = json.loads((tmp_path / "pending_assets.json").read_text())
+        assert [r["value"]["i"] for r in records] == [0, 1, 2]
+
+    def test_corrupt_file_is_never_silently_overwritten(self, tmp_path):
+        (tmp_path / "pending_assets.json").write_text("{ not a json array")
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        with pytest.raises(ed.PersistenceError):
+            store.add(self._finding(0))
+
+    def test_unicode_and_control_characters_round_trip(self, tmp_path):
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        payload = '/café/日本\n"quoted"\\backslash'
+        store.add(ed.make_finding("x", "münchen.de", {"p": payload}, ["ünicode ✓"], "LOW"))
+        records = json.loads((tmp_path / "pending_assets.json").read_text())
+        assert records[0]["value"]["p"] == payload
+        assert records[0]["target"] == "münchen.de"
+
+    def test_concurrent_appends_lose_nothing(self, tmp_path):
+        import threading
+        store = ed.PendingAssetsStore(output_dir=str(tmp_path))
+        threads = [threading.Thread(target=lambda i=i: store.add_many(
+            [self._finding(i * 10 + j) for j in range(10)])) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(json.loads((tmp_path / "pending_assets.json").read_text())) == 80
+
+
+class TestBaselineConcurrency:
+    def test_one_baseline_probe_per_root_under_concurrency(self):
+        import threading
+        state = ed._EnumerationState(SAFE_TARGET, None, 10_000, 2, [], [])
+        calls = []
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            time.sleep(0.01)
+            return _fake_response(404, body=b"<html>404</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            threads = [threading.Thread(
+                target=lambda: state.get_baseline("https://example.com/x/y", 1.0)) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        # Eight workers arriving at one new root must share a single probe.
+        assert len(calls) == ed.BASELINE_PROBE_COUNT
+        assert len(state.baselines()) == 1
+
+    def test_baseline_cache_is_capped(self):
+        state = ed._EnumerationState(SAFE_TARGET, None, 10_000, 2, [], [], max_baselines=3)
+        with mock.patch("requests.get", side_effect=_all_404):
+            for i in range(10):
+                state.get_baseline(f"https://example.com/d{i}/x", 1.0)
+        assert len(state.baselines()) <= 3
+
+    def test_skipped_probes_return_their_budget_reservation(self):
+        state = ed._EnumerationState(SAFE_TARGET, None, 100, 0, [], [])
+        assert state.reserve_request() is True
+        assert state.request_count == 1
+        state.release_request()
+        assert state.request_count == 0
+
+
+class TestControlCharacterUrls:
+    @pytest.mark.parametrize("url", [
+        "https://example.com/a\r\nX-Injected: 1",
+        "https://example.com/a\nb",
+        "https://example.com/a\x00b",
+        "https://example.com/a\tb",
+    ])
+    def test_control_characters_are_rejected(self, url):
+        with pytest.raises(ed.ScopeError):
+            ed.validate_endpoint_target(url, target=SAFE_TARGET)
+
+    def test_control_character_wordlist_entry_is_reported_not_requested(self, tmp_path):
+        # An embedded newline cannot survive a line-based wordlist, so the
+        # entry uses characters that do: a tab and a NUL.
+        wl_dir = _write_wordlist(tmp_path, "directories.txt", ["ok/", "ba\td/", "n\x00ul/"])
+        _write_wordlist(tmp_path, "api_endpoints.txt", ["u"])
+        seen = []
+
+        def fake_get(url, **kwargs):
+            seen.append(url)
+            return _fake_response(404, body=b"<html>404</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"), wordlists_dir=wl_dir)
+        assert not any(c in u for u in seen for c in "\r\n\x00")
+        assert any(e.get("stage") == "scope" for e in result["errors"])
+
+
+class TestTechnologySelectionPrecision:
+    @pytest.mark.parametrize("technology,expected", [
+        ({"cms": "WordPress"}, ["wordpress_paths.txt"]),
+        ({"frameworks": [{"name": "Laravel"}]}, ["laravel_paths.txt"]),
+        ({"x": ["laravel-mix"]}, ["laravel_paths.txt"]),      # hyphen is a boundary
+        ({"waf": "Djangoshield"}, []),                        # not Django
+        ({"js": "wordpressify"}, []),                         # not WordPress
+        ({}, []),
+        (None, []),
+        (42, []),
+    ])
+    def test_framework_matching_uses_word_boundaries(self, technology, expected):
+        assert [w for w, _ in ed.select_wordlists_for_technology(technology)] == expected
+
+
+class TestBlockedProbeAccounting:
+    def test_a_429_that_is_also_the_root_error_mode_is_counted_once(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["a/", "b/", "c/"], apis=["u"])
+        with mock.patch("requests.get", side_effect=_catch_all_get(429, b"slow")):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_workers=1)
+        assert result["blocked_probes"] <= result["requests_made"]
+        assert result["enumeration_conclusive"] is False
+
+    def test_requests_made_counts_only_requests_actually_sent(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=[f"d{i}/" for i in range(30)], apis=["u"])
+        sent = []
+
+        def fake_get(url, **kwargs):
+            sent.append(url)
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            return _fake_response(429, headers={"Retry-After": "300"}, body=b"slow")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_workers=1)
+        assert result["requests_made"] == len(sent)
+
+
+class TestRedirectHandling:
+    def test_out_of_scope_redirect_target_is_recorded_but_not_followed(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["a"], apis=["u"])
+        sent = []
+
+        def fake_get(url, **kwargs):
+            sent.append(url)
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            if url.endswith("/a"):
+                return _fake_response(302, headers={"Location": "https://evil.com/x"}, body=b"")
+            return _fake_response(404, body=b"<html>404</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_depth=2)
+        assert not any("evil.com" in u for u in sent)
+        redirects = [e for e in result["endpoints"] if e["discovery_type"] == ed.DT_REDIRECT]
+        # The observation is evidence and is kept; only the request is refused.
+        assert redirects and redirects[0]["redirect_location"] == "https://evil.com/x"
+
+    def test_in_scope_redirect_target_is_queued(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["a"], apis=["u"])
+        sent = []
+
+        def fake_get(url, **kwargs):
+            sent.append(url)
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            if url.endswith("/a"):
+                return _fake_response(302, headers={"Location": "/moved-here"}, body=b"")
+            if url.endswith("/moved-here"):
+                return _fake_response(200, headers={"Content-Type": "text/html"},
+                                      body=b"<html>The real relocated page</html>")
+            return _fake_response(404, body=b"<html>404</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_depth=2)
+        assert "https://example.com/moved-here" in sent
+        assert any(e["path"] == "/moved-here" for e in result["endpoints"])
+
+
+class TestUnstableBaseline:
+    def test_inconsistent_probe_statuses_make_the_baseline_unusable(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["admin/", "x.php"], apis=["u"])
+        toggle = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                toggle["n"] += 1
+                return _fake_response(200 if toggle["n"] % 2 else 404,
+                                      headers={"Content-Type": "text/html"},
+                                      body=b"<html>maybe</html>")
+            return _fake_response(200, headers={"Content-Type": "text/html"},
+                                  body=b"<html>a real page</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_workers=1)
+        assert result["baseline_unavailable"] is True
+        assert result["enumeration_conclusive"] is False
+        assert all(e["confidence"] != ed.CONFIDENCE_HIGH for e in result["endpoints"])
+
+    def test_failed_baseline_probe_is_retried_before_being_accepted(self):
+        state = ed._EnumerationState(SAFE_TARGET, None, 10_000, 0, [], [])
+        attempts = {"n": 0}
+
+        def fake_get(url, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] <= ed.BASELINE_PROBE_COUNT:
+                raise requests.exceptions.Timeout("transient")
+            return _fake_response(404, body=b"<html>404 not found</html>")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            first = state.get_baseline("https://example.com/x", 1.0)
+            assert first["available"] is False
+            second = state.get_baseline("https://example.com/x", 1.0)
+        # A transient failure must not disable catch-all detection for the run.
+        assert second["available"] is True
+
+    def test_permanently_failing_baseline_stops_retrying(self):
+        state = ed._EnumerationState(SAFE_TARGET, None, 10_000, 0, [], [])
+        calls = []
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            raise requests.exceptions.Timeout("always down")
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            for _ in range(10):
+                state.get_baseline("https://example.com/x", 1.0)
+        assert len(calls) <= ed.BASELINE_MAX_ATTEMPTS * ed.BASELINE_PROBE_COUNT
+
+
+class TestDynamicCatchAll:
+    """
+    A catch-all whose body genuinely differs per request is the hardest case:
+    the structural signature can miss it, and length comparison is meaningless
+    for it. Content overlap is what remains, and confidence is capped to match
+    what the baseline can actually support.
+    """
+
+    @staticmethod
+    def _dynamic_baseline(samples):
+        return {"available": True, "usable": True, "dynamic": True, "status_codes": [200],
+                "body_hashes": [ed._content_signature(s)[1] for s in samples],
+                "structural_hashes": [ed._structural_signature(s, "/probe") for s in samples],
+                "content_lengths": [len(s) for s in samples],
+                "normalized_bodies": list(samples)}
+
+    def test_dynamic_catch_all_is_matched_by_content_overlap(self):
+        baseline = self._dynamic_baseline([
+            "Sorry, that page could not be located on this server. Reference 111",
+            "Sorry, that page could not be located on this server. Reference 222",
+        ])
+        variant = "Sorry, that page could not be located on this server. Reference 987"
+        assert ed.matches_catch_all(
+            {"status_code": 200, "body": variant, "headers": {}}, baseline, "/admin") is True
+
+    def test_dynamic_catch_all_matching_does_not_swallow_real_content(self):
+        baseline = self._dynamic_baseline([
+            "Sorry, that page could not be located on this server. Reference 111",
+            "Sorry, that page could not be located on this server. Reference 222",
+        ])
+        real = ("Administration console. Manage users, roles, billing and audit logs. "
+                "Deploy configuration and rotate credentials.")
+        assert ed.matches_catch_all(
+            {"status_code": 200, "body": real, "headers": {}}, baseline, "/admin") is False
+
+    def test_content_confirmed_against_a_dynamic_baseline_is_capped_at_medium(self):
+        baseline = self._dynamic_baseline(["error one here now", "error two here now"])
+        dtype, conf, notes = ed.classify_response(
+            {"status_code": 200, "body": "a completely different real page", "headers": {}},
+            baseline, "/x")
+        assert dtype == ed.DT_CONTENT_CONFIRMED
+        assert conf == ed.CONFIDENCE_MEDIUM
+        assert any("different body to each request" in n for n in notes)
+
+    def test_static_baseline_still_yields_high_confidence(self):
+        baseline = {"available": True, "usable": True, "dynamic": False, "status_codes": [404],
+                    "body_hashes": [ed._content_signature("nope")[1]], "structural_hashes": [],
+                    "content_lengths": [4], "normalized_bodies": ["nope"]}
+        dtype, conf, _ = ed.classify_response(
+            {"status_code": 200, "body": "a real page with genuine content", "headers": {}},
+            baseline, "/x")
+        assert (dtype, conf) == (ed.DT_CONTENT_CONFIRMED, ed.CONFIDENCE_HIGH)
+
+    def test_near_empty_body_is_not_matched_by_overlap_alone(self):
+        baseline = self._dynamic_baseline([
+            "the requested resource was not found on this server please check the address",
+            "the requested resource was not found on this server please check the url",
+        ])
+        # Omits the wording the error page always uses, and has too few
+        # tokens to conclude anything from vocabulary overlap.
+        assert ed.matches_catch_all(
+            {"status_code": 200, "body": "not found", "headers": {}}, baseline, "/x") is False
+
+    def test_shared_chrome_does_not_suppress_real_pages(self):
+        """
+        The failure mode the novelty ceiling exists to prevent: when a site's
+        404 page carries the same navigation and footer as every other page,
+        core containment alone would classify every real page as the catch-all
+        and report an entire site as empty.
+        """
+        chrome = ("Acme Corporation Home Products Pricing Support Careers Contact "
+                  "Privacy Terms copyright 2026 all rights reserved ")
+        baseline = self._dynamic_baseline([
+            chrome + "The page you requested does not exist. Code 111",
+            chrome + "The page you requested does not exist. Code 222",
+        ])
+        real_page = chrome + (
+            "Billing dashboard. Review invoices, download statements, update payment "
+            "methods, manage subscription tiers and configure dunning notifications "
+            "for delinquent accounts across every organisation you administer.")
+        assert ed.matches_catch_all(
+            {"status_code": 200, "body": real_page, "headers": {}}, baseline, "/billing") is False
+        # ... while a re-render of the error page itself is still suppressed.
+        assert ed.matches_catch_all(
+            {"status_code": 200, "body": chrome + "The page you requested does not exist. Code 987",
+             "headers": {}}, baseline, "/nope") is True
+
+
+class TestMalformedCallerPayloads:
+    """
+    historical_data / js_data come from other modules' output. A shape that is
+    merely unusual must degrade, never corrupt the graph or abort the run.
+    """
+
+    @pytest.mark.parametrize("evidence,expected", [
+        ("a single evidence string", ["a single evidence string"]),
+        (["a", "b"], ["a", "b"]),
+        (("x",), ["x"]),
+        (42, ["42"]),
+    ])
+    def test_string_evidence_is_not_exploded_into_characters(self, evidence, expected):
+        result = ed.correlate_historical_parameters(
+            [], [{"url": "/x", "evidence": evidence}], target=SAFE_TARGET)
+        assert result["endpoints"][0]["evidence"] == expected
+
+    @pytest.mark.parametrize("evidence", [None, [], ["", "  "]])
+    def test_empty_evidence_falls_back_to_a_real_sentence(self, evidence):
+        result = ed.correlate_historical_parameters(
+            [], [{"url": "/x", "evidence": evidence}], target=SAFE_TARGET)
+        assert result["endpoints"][0]["evidence"] == ["Historical reference from wayback_intel.py"]
+
+    def test_junk_entries_are_skipped_without_crashing(self, tmp_path):
+        junk = [None, 42, "string", {"no_url": 1}, {"url": None},
+                {"url": "/x", "parameters": "notalist"},
+                {"url": "/y", "parameters": [None, {"noname": 1}, {"name": ""}, {"name": "ok"}]}]
+        out = tmp_path / "out"
+        store = ed.PendingAssetsStore(output_dir=str(out))
+        historical = ed.correlate_historical_parameters(junk, [], target=SAFE_TARGET)  # empty data
+        assert historical["endpoints"] == []
+        result = ed.correlate_historical_parameters([], junk, target=SAFE_TARGET, store=store)
+        assert [p["name"] for p in result["parameters"]] == ["ok"]
+        json.loads((out / "pending_assets.json").read_text())
+
+    def test_js_payload_junk_is_handled_identically(self):
+        result = ed.correlate_javascript_parameters(
+            [], [None, 42, {"url": "/y", "parameters": [{"name": "ok"}]}], target=SAFE_TARGET)
+        assert [p["name"] for p in result["parameters"]] == ["ok"]
+
+
+class TestDegenerateInputs:
+    @pytest.mark.parametrize("base", [
+        "https://example.com", "https://example.com/?a=1", "https://example.com/#frag",
+        "https://EXAMPLE.COM./", "https://example.com:443/",
+    ])
+    def test_degenerate_base_urls_complete(self, base, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["admin/"], apis=["u"])
+        with mock.patch("requests.get", side_effect=_all_404):
+            result = ed.run_endpoint_discovery(
+                base, target=SAFE_TARGET, output_dir=str(tmp_path / "out"), wordlists_dir=wl_dir)
+        assert result["status"] in ("completed", "completed_with_errors")
+
+    @pytest.mark.parametrize("limits", [
+        {"max_depth": 0}, {"max_requests": 0}, {"max_requests": -5}, {"max_depth": -1},
+        {"max_workers": 0}, {"max_workers": -3}, {"timeout": 0},
+    ])
+    def test_degenerate_limits_do_not_crash(self, limits, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["admin/"], apis=["u"])
+        with mock.patch("requests.get", side_effect=_all_404):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, **limits)
+        assert result["requests_made"] >= 0
+        if limits.get("max_requests", 1) <= 0 or limits.get("max_depth", 0) < 0:
+            # Nothing was probed, so nothing can be claimed about what exists.
+            assert result["enumeration_conclusive"] is False
+
+    def test_missing_content_type_still_parses_forms(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["admin/"], apis=["u"])
+
+        def fake_get(url, **kwargs):
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            return _fake_response(200, headers={}, body=b'<html><form><input name="q"></form></html>')
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            result = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=wl_dir, max_depth=0)
+        assert any(p["name"] == "q" for p in result["parameters"])
+
+    def test_ip_target_does_not_follow_links_to_other_ips(self, tmp_path):
+        wl_dir = _wordlists(tmp_path, dirs=["admin/"], apis=["u"])
+        sent = []
+
+        def fake_get(url, **kwargs):
+            sent.append(url)
+            if "reconhound-nonexistent-check" in url:
+                return _fake_response(404, body=b"<html>404</html>")
+            return _fake_response(200, headers={"Content-Type": "text/html"}, body=(
+                b'<html><a href="http://203.0.113.7/ok">self</a>'
+                b'<a href="http://198.51.100.9/other">elsewhere</a></html>'))
+
+        with mock.patch("requests.get", side_effect=fake_get):
+            ed.run_endpoint_discovery("http://203.0.113.7/", target="203.0.113.7",
+                                      output_dir=str(tmp_path / "out"), wordlists_dir=wl_dir,
+                                      max_depth=1)
+        assert any("203.0.113.7/ok" in u for u in sent)
+        assert not any("198.51.100.9" in u for u in sent)
+
+    def test_baseline_cache_falls_back_to_nearest_ancestor(self):
+        state = ed._EnumerationState(SAFE_TARGET, None, 100_000, 3, [], [], max_baselines=2)
+        with mock.patch("requests.get", side_effect=_all_404):
+            state.get_baseline("https://example.com/x", 1.0)
+            state.get_baseline("https://example.com/deep/y", 1.0)
+            deepest = state.get_baseline("https://example.com/deep/deeper/z", 1.0)
+        assert len(state.baselines()) == 2
+        assert deepest["root"] == "https://example.com/deep/"
 
 
 if __name__ == "__main__":
