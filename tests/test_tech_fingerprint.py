@@ -478,11 +478,18 @@ class TestConfidenceScoring:
         result = tf._finalize_detections(scan, SAFE_URL)
         assert [d["technology"] for d in result] == ["Alpha", "Zebra"]
 
-    def test_finalize_detections_uses_confirmed_url_when_present(self):
+    def test_finalize_detections_preserves_confirmed_url_without_splitting_asset_identity(self):
+        # `url` is the asset key surface_mapper.py builds a technology asset
+        # from (technology:<url>:<name>). Emitting the corroborating probe path
+        # there split one WordPress install into two technology assets — and so
+        # into two duplicate `technology_specific_enumeration` opportunities —
+        # depending on whether known-path corroboration happened to run. The
+        # corroborating URL is evidence and is preserved as such.
         scan = {"WordPress": {"category": "cms", "evidence": ["e"], "score": 2, "version": None,
                                "confirmed_url": "https://example.com/wp-login.php"}}
         result = tf._finalize_detections(scan, SAFE_URL)
-        assert result[0]["url"] == "https://example.com/wp-login.php"
+        assert result[0]["url"] == SAFE_URL
+        assert result[0]["corroborating_urls"] == ["https://example.com/wp-login.php"]
 
     def test_finalize_detections_falls_back_to_base_url(self):
         scan = {"WordPress": {"category": "cms", "evidence": ["e"], "score": 2, "version": None}}
@@ -904,3 +911,681 @@ class TestRunTechFingerprint:
         with mock.patch("requests.get", side_effect=responses):
             result = tf.run_tech_fingerprint(SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "output"))
         json.dumps(result)
+
+
+# ===========================================================================
+# Forensic-audit regression suite.
+#
+# Every test below pins a defect that was reproduced against this module and
+# then fixed. Each one fails on the pre-audit implementation.
+# ===========================================================================
+
+import time as _time
+
+
+def _resp_seq(*responses):
+    """requests.get side_effect that replays a sequence and then repeats the last."""
+    state = {"i": 0}
+
+    def _get(*args, **kwargs):
+        i = min(state["i"], len(responses) - 1)
+        state["i"] += 1
+        return responses[i]
+
+    return _get
+
+
+# ---------------------------------------------------------------------------
+# D1 — catastrophic backtracking in the <meta generator> scan (CPU DoS)
+# ---------------------------------------------------------------------------
+
+class TestMetaGeneratorPerformanceAndParsing:
+    def test_adversarial_meta_body_does_not_blow_up(self):
+        # Pre-fix: `<meta[^>]+name=...` backtracked quadratically over a body
+        # of repeated "<meta " tokens — 21.3 s for one 128 KB body, ~50 s for
+        # a full run, from a single HTTP response.
+        body = ("<meta " * (tf.DEFAULT_MAX_BODY_BYTES // 6))[: tf.DEFAULT_MAX_BODY_BYTES]
+        start = _time.perf_counter()
+        tf.detect_technologies_from_content({}, [], body, "baseline_response")
+        assert _time.perf_counter() - start < 2.0
+
+    def test_unterminated_and_giant_tags_are_bounded(self):
+        for body in ("<" + "meta name=x " * 20000, "<meta " + "a=1 " * 30000 + ">",
+                      '<meta name="generator" content="x' * 5000):
+            start = _time.perf_counter()
+            tf.extract_generator_declarations(body)
+            assert _time.perf_counter() - start < 1.0
+
+    def test_generator_content_before_name_is_detected(self):
+        # Pre-fix the regex required content= to follow name=, so this common
+        # (and equally valid) attribute order produced no detection at all.
+        content, version = tf._extract_meta_generator(
+            '<meta content="WordPress 6.4.2" name="generator">', "WordPress")
+        assert content == "WordPress 6.4.2"
+        assert version == "6.4.2"
+
+    def test_unquoted_and_uppercase_attributes(self):
+        assert tf.extract_generator_declarations("<meta name=generator content=Drupal>") == ["Drupal"]
+        assert tf.extract_generator_declarations(
+            '<meta NAME="generator" CONTENT="WordPress 6.4">') == ["WordPress 6.4"]
+
+    def test_non_generator_meta_is_ignored(self):
+        assert tf.extract_generator_declarations('<meta name="description" content="WordPress 9.9">') == []
+
+
+# ---------------------------------------------------------------------------
+# D2 — invented / implausible versions
+# ---------------------------------------------------------------------------
+
+class TestVersionPrecision:
+    def test_prose_number_is_not_a_version(self):
+        # Pre-fix this reported WordPress version "2003" and handed it to
+        # vuln_intel.py as a fact to match CVEs against.
+        content, version = tf._extract_meta_generator(
+            '<meta name="generator" content="Powered by WordPress since 2003">', "WordPress")
+        assert content is not None
+        assert version is None
+
+    @pytest.mark.parametrize("declared,product,expected", [
+        ("WordPress 6.4.2", "WordPress", "6.4.2"),
+        ("WordPress v6.4", "WordPress", "6.4"),
+        ("Drupal 10 (https://www.drupal.org)", "Drupal", "10"),
+        ("Drupal 7 (http://drupal.org)", "Drupal", "7"),
+        ("Joomla! 4.2.3", "Joomla", "4.2.3"),
+        ("Joomla! - Open Source Content Management", "Joomla", None),
+        ("WordPress", "WordPress", None),
+    ])
+    def test_real_generator_strings(self, declared, product, expected):
+        _, version = tf._extract_meta_generator(
+            f'<meta name="generator" content="{declared}">', product)
+        assert version == expected
+
+    @pytest.mark.parametrize("token", ["99999999999999.1.1", "1.2.3.4.5", "a.b", "", None, "..."])
+    def test_implausible_versions_rejected(self, token):
+        assert tf._plausible_version(token) is None
+
+    @pytest.mark.parametrize("token", ["1", "1.2", "1.18.0", "10.0.19041.1"])
+    def test_plausible_versions_accepted(self, token):
+        assert tf._plausible_version(token) == token
+
+    def test_target_supplied_ng_version_is_not_reproduced(self):
+        scan = tf.detect_technologies_from_content({}, [], '<div ng-version="99999999999999.1.1">', "b")
+        assert scan["Angular"]["version"] is None
+        assert tf.detect_technologies_from_content(
+            {}, [], '<div ng-version="17.0.8">', "b")["Angular"]["version"] == "17.0.8"
+
+    def test_server_header_version_is_plausibility_checked(self):
+        assert tf.detect_servers({"Server": "nginx/1.18.0"})["Nginx"]["version"] == "1.18.0"
+        assert tf.detect_servers({"Server": "nginx/99999999.1.1.1.1"})["Nginx"]["version"] is None
+
+
+# ---------------------------------------------------------------------------
+# D3 — confidence inflation from repeated (non-independent) evidence
+# ---------------------------------------------------------------------------
+
+class TestSignalKeyedConfidence:
+    def test_same_marker_on_error_page_does_not_raise_confidence(self):
+        # A 404 page sharing the homepage's theme (or an SPA catch-all echoing
+        # the homepage) made one weak marker score twice and reach MEDIUM.
+        html = '<html><link href="/wp-content/themes/x/style.css"></html>'
+        base = tf.detect_technologies_from_content({}, [], html, "baseline_response")
+        err = tf.detect_technologies_from_content({}, [], html, "error_page_response")
+        merged = tf._merge_scan_maps(base, err)
+        assert merged["WordPress"]["score"] == base["WordPress"]["score"]
+        assert tf._confidence_for_score(merged["WordPress"]["score"]) == tf.CONFIDENCE_LOW
+        # Evidence from both sources is still preserved in full.
+        assert len(merged["WordPress"]["evidence"]) == 2
+
+    def test_distinct_markers_still_converge(self):
+        html = '<html>wp-content/ wp-includes/ wp-json</html>'
+        scan = tf.detect_technologies_from_content({}, [], html, "baseline_response")
+        assert tf._confidence_for_score(scan["WordPress"]["score"]) == tf.CONFIDENCE_HIGH
+
+    def test_error_page_only_signal_still_adds(self):
+        base = tf.detect_technologies_from_content({}, [], "<html>nothing</html>", "baseline_response")
+        err = tf.detect_technologies_from_content(
+            {}, [], "<html>Whoops, looks like something went wrong</html>", "error_page_response")
+        merged = tf._merge_scan_maps(base, err)
+        assert "Laravel" in merged and merged["Laravel"]["score"] == tf._SCORE_WEAK
+
+    def test_many_cookies_matching_one_pattern_score_once(self):
+        # Pre-fix: 5 WordPress cookies scored 5 (HIGH); 100 scored 100 and
+        # produced 100 persisted evidence strings.
+        names = tf.parse_cookie_names([f"wordpress_{i}=v" for i in range(100)])
+        scan = tf.detect_technologies_from_content({}, names, "", "baseline_response")
+        assert scan["WordPress"]["score"] == tf._SCORE_WEAK
+        assert len(scan["WordPress"]["evidence"]) == 1
+        assert "+95 more" in scan["WordPress"]["evidence"][0]
+
+    def test_two_distinct_cookie_patterns_reach_medium(self):
+        names = tf.parse_cookie_names(["wordpress_logged_in=a", "wp-settings-1=b"])
+        scan = tf.detect_technologies_from_content({}, names, "", "baseline_response")
+        assert tf._confidence_for_score(scan["WordPress"]["score"]) == tf.CONFIDENCE_MEDIUM
+
+    def test_merge_of_unkeyed_records_keeps_additive_behaviour(self):
+        a = {"X": {"category": "cms", "evidence": ["a"], "score": 1, "version": None}}
+        b = {"X": {"category": "cms", "evidence": ["b"], "score": 2, "version": None}}
+        assert tf._merge_scan_maps(a, b)["X"]["score"] == 3
+
+    def test_merge_tolerates_records_without_category(self):
+        assert tf._merge_scan_maps({"X": {"evidence": ["e"], "score": 1}})["X"]["category"] is None
+
+
+# ---------------------------------------------------------------------------
+# D4 — false positives from over-broad signatures
+# ---------------------------------------------------------------------------
+
+class TestFalsePositiveHardening:
+    @pytest.mark.parametrize("body", [
+        '<div class="training-app">',            # "ng-app" substring of a word
+        '<script>var x = "ng-app"</script>',     # marker inside script text
+        'we use react-dom in our docs',          # package mentioned in prose
+        '{"attrs": {"data-v-model": true}}',     # JSON attribute, not Vue scoping
+    ])
+    def test_prose_and_json_do_not_produce_client_framework_detections(self, body):
+        assert tf.detect_technologies_from_content({}, [], body, "b") == {}
+
+    @pytest.mark.parametrize("body,tech", [
+        ('<html ng-app="myApp">', "Angular"),
+        ('<script src="/static/react-dom.production.min.js">', "React"),
+        ('<div data-v-7ba5bd90>', "Vue"),
+        ('<div data-reactroot>', "React"),
+    ])
+    def test_genuine_client_framework_markers_still_match(self, body, tech):
+        assert tech in tf.detect_technologies_from_content({}, [], body, "b")
+
+    def test_apache_coyote_is_not_apache(self):
+        # Apache-Coyote is Tomcat's HTTP connector, not the Apache HTTP server.
+        assert tf.detect_servers({"Server": "Apache-Coyote/1.1"}) == {}
+
+    def test_real_apache_and_nginx_still_match(self):
+        assert "Apache" in tf.detect_servers({"Server": "Apache/2.4.41 (Ubuntu)"})
+        assert "Nginx" in tf.detect_servers({"Server": "nginx"})
+        assert "Microsoft IIS" in tf.detect_servers({"Server": "Microsoft-IIS/10.0"})
+
+    def test_waf_cookie_markers_match_names_not_values(self):
+        # Pre-fix the marker was searched in the whole raw Set-Cookie string,
+        # so any cookie *value* containing "akamai"/"ts01" produced a WAF hit.
+        assert tf.detect_wafs({}, ["pref=my-akamai-favourite-thing"], "") == {}
+        assert tf.detect_wafs({}, ["sid=ts01abcdef"], "") == {}
+
+    def test_waf_cookie_names_still_match(self):
+        assert "Cloudflare" in tf.detect_wafs({}, ["__cfduid=abc; Path=/"], "")
+        assert "F5" in tf.detect_wafs({}, ["BIGipServerpool=1.2.3"], "")
+        assert "Imperva" in tf.detect_wafs({}, ["incap_ses_123_456=x"], "")
+
+
+# ---------------------------------------------------------------------------
+# D5 — known-path corroboration on catch-all / soft-404 origins
+# ---------------------------------------------------------------------------
+
+class TestKnownPathSoft404Awareness:
+    def test_catch_all_origin_suppresses_marker_less_corroboration(self):
+        # An origin that answers every path with 200 makes a marker-less 200
+        # meaningless; pre-fix each such path added weak evidence, taking a
+        # soft-404 site with two generic markers to HIGH.
+        soft = {"status": "found", "status_code": 200, "body": "<html>App shell</html>"}
+        resp = _fake_response(status_code=200, body=b"some admin content")
+        with mock.patch("requests.get", return_value=resp):
+            assert tf.probe_known_paths(SAFE_URL, ["Magento"], soft_404=soft) == {}
+
+    def test_body_identical_to_catch_all_control_contributes_nothing(self):
+        shell = "<html>App user_login shell</html>"
+        soft = {"status": "found", "status_code": 200, "body": shell}
+        resp = _fake_response(status_code=200, body=shell.encode())
+        with mock.patch("requests.get", return_value=resp):
+            assert tf.probe_known_paths(SAFE_URL, ["WordPress"], soft_404=soft) == {}
+
+    def test_real_404_control_keeps_corroboration(self):
+        soft = {"status": "found", "status_code": 404, "body": "not found"}
+        resp = _fake_response(status_code=200, body=b"<form>user_login</form>")
+        with mock.patch("requests.get", return_value=resp):
+            result = tf.probe_known_paths(SAFE_URL, ["WordPress"], soft_404=soft)
+        assert result["WordPress"]["score"] >= tf._SCORE_STRONG
+
+    def test_distinct_content_on_catch_all_origin_still_corroborates(self):
+        soft = {"status": "found", "status_code": 200, "body": "<html>App shell</html>"}
+        resp = _fake_response(status_code=200, body=b"<form>user_login field</form>")
+        with mock.patch("requests.get", return_value=resp):
+            result = tf.probe_known_paths(SAFE_URL, ["WordPress"], soft_404=soft)
+        assert result["WordPress"]["score"] == tf._SCORE_STRONG
+
+    @pytest.mark.parametrize("junk", [None, {}, {"status": "error"},
+                                       {"status": "found", "status_code": None},
+                                       {"status": "found", "status_code": "200"}])
+    def test_malformed_soft_404_control_falls_back_to_original_behaviour(self, junk):
+        resp = _fake_response(status_code=200, body=b"some admin content")
+        with mock.patch("requests.get", return_value=resp):
+            result = tf.probe_known_paths(SAFE_URL, ["Magento"], soft_404=junk)
+        assert "Magento" in result
+
+    def test_repeated_probe_of_the_same_path_scores_once(self):
+        resp = _fake_response(status_code=200, body=b"<form>user_login</form>")
+        with mock.patch("requests.get", return_value=resp):
+            a = tf.probe_known_paths(SAFE_URL, ["WordPress"])
+            b = tf.probe_known_paths(SAFE_URL, ["WordPress"])
+        merged = tf._merge_scan_maps(a, b)
+        assert merged["WordPress"]["score"] == a["WordPress"]["score"]
+
+
+# ---------------------------------------------------------------------------
+# D6 — evidence loss / asset-identity split in the merge
+# ---------------------------------------------------------------------------
+
+class TestCorroboratingUrlPreservation:
+    def test_merge_preserves_corroborating_urls(self):
+        # _merge_scan_maps silently dropped every key it did not copy, so
+        # confirmed_url never survived to the output in the real pipeline.
+        corr = {"WordPress": {"category": "cms", "evidence": ["e"], "signals": {"path:x": 2},
+                               "score": 2, "version": None,
+                               "confirmed_url": "https://example.com/wp-login.php"}}
+        merged = tf._merge_scan_maps({}, corr)
+        assert merged["WordPress"]["corroborating_urls"] == ["https://example.com/wp-login.php"]
+
+    def test_detection_url_is_the_fingerprinted_url_not_the_probe_path(self, tmp_path):
+        baseline = _fake_response(
+            status_code=200,
+            body=b'<html>wp-content/ wp-includes/ wp-json</html>')
+        error_page = _fake_response(status_code=404, body=b"nope")
+        hit = _fake_response(status_code=200, body=b"<form>user_login</form>")
+        with mock.patch("requests.get", side_effect=_resp_seq(baseline, error_page, hit)):
+            result = tf.run_tech_fingerprint(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "o"), check_favicon=False)
+        wp = next(d for d in result["technology_summary"]["detections"] if d["technology"] == "WordPress")
+        assert wp["url"] == SAFE_URL
+        assert any(u.endswith("wp-login.php") for u in wp["corroborating_urls"])
+
+
+# ---------------------------------------------------------------------------
+# D7 — failure must never become absence (negative-result memory)
+# ---------------------------------------------------------------------------
+
+class TestNegativeResultHonesty:
+    def _run(self, tmp_path, response, **kwargs):
+        with mock.patch("requests.get", return_value=response):
+            return tf.run_tech_fingerprint(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "o"),
+                check_favicon=False, **kwargs)
+
+    @pytest.mark.parametrize("code,body,label", [
+        (301, b"", "redirect"),
+        (403, b"<html>Attention Required! | Cloudflare</html>", "blocked"),
+        (500, b"<html>server error</html>", "server error"),
+        (200, b"", "empty body"),
+    ])
+    def test_non_representative_response_records_no_negative_memory(self, tmp_path, code, body, label):
+        headers = {"Location": "https://x/"} if code == 301 else {}
+        result = self._run(tmp_path, _fake_response(status_code=code, headers=headers, body=body))
+        assert result["negative_result_memory"]["persisted"] is False
+        assert result["negative_result_memory"]["reason"]
+        store_path = tmp_path / "o" / "pending_assets.json"
+        records = json.loads(store_path.read_text()) if store_path.exists() else []
+        assert not any(r["type"] == "tech_fingerprint_checked_no_match" for r in records)
+
+    def test_truncated_body_is_not_a_completed_check(self, tmp_path):
+        big = b"<html>" + b"x" * (tf.DEFAULT_MAX_BODY_BYTES + 100)
+        result = self._run(tmp_path, _fake_response(status_code=200, body=big))
+        assert result["body_truncated"] is True
+        assert result["negative_result_memory"]["persisted"] is False
+
+    def test_undecodable_body_is_not_a_completed_check(self):
+        assessment = tf.assess_response_representativeness({
+            "status": "found", "status_code": 200, "headers": {}, "body": "",
+            "body_error": "DecodeError: bad gzip"})
+        assert assessment["representative"] is False
+        assert any("could not be read" in r for r in assessment["reasons"])
+
+    def test_failed_error_page_probe_suppresses_negative_memory(self, tmp_path):
+        baseline = _fake_response(status_code=200, body=b"<html>nothing at all</html>")
+        with mock.patch("requests.get", side_effect=_resp_seq(
+                baseline, requests.exceptions.ConnectionError("refused"))):
+            pass
+        calls = {"n": 0}
+
+        def _get(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return baseline
+            raise requests.exceptions.ConnectionError("refused")
+
+        with mock.patch("requests.get", side_effect=_get):
+            result = tf.run_tech_fingerprint(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "o"), check_favicon=False)
+        assert result["negative_result_memory"]["persisted"] is False
+        assert "error-page" in result["negative_result_memory"]["reason"]
+
+    def test_representative_response_still_records_negative_memory_with_audit_trail(self, tmp_path):
+        baseline = _fake_response(status_code=200, headers={"Content-Type": "text/html"},
+                                   body=b"<html>nothing here</html>")
+        error_page = _fake_response(status_code=404, body=b"")
+        with mock.patch("requests.get", side_effect=_resp_seq(baseline, error_page)):
+            result = tf.run_tech_fingerprint(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "o"),
+                check_favicon=False, probe_known_paths_enabled=False)
+        assert result["negative_result_memory"]["persisted"] is True
+        records = json.loads((tmp_path / "o" / "pending_assets.json").read_text())
+        negatives = [r for r in records if r["type"] == "tech_fingerprint_checked_no_match"]
+        assert len(negatives) == 4
+        observation = negatives[0]["metadata"]["observation"]
+        assert observation["status_code"] == 200
+        assert observation["content_type"] == "text/html"
+        assert observation["body_truncated"] is False
+        assert observation["error_page_checked"] is True
+
+    def test_positive_evidence_on_an_error_page_is_still_reported(self, tmp_path):
+        # Non-representative for *absence* claims, but a Whoops 500 page is
+        # excellent positive evidence and must not be discarded.
+        result = self._run(tmp_path, _fake_response(
+            status_code=500, body=b"<html>Whoops, looks like something went wrong</html>"))
+        assert any(d["technology"] == "Laravel" for d in result["technology_summary"]["detections"])
+
+
+# ---------------------------------------------------------------------------
+# D8 — conflict preservation within one fingerprint
+# ---------------------------------------------------------------------------
+
+class TestConflictDetection:
+    def _det(self, name, category, confidence):
+        return {"technology": name, "category": category, "version": None, "evidence": ["e"],
+                "confidence": confidence, "url": SAFE_URL, "corroborating_urls": []}
+
+    def test_multiple_cms_at_medium_plus_is_a_conflict(self):
+        conflicts = tf.detect_detection_conflicts([
+            self._det("WordPress", tf.CATEGORY_CMS, tf.CONFIDENCE_HIGH),
+            self._det("Drupal", tf.CATEGORY_CMS, tf.CONFIDENCE_MEDIUM)])
+        assert len(conflicts) == 1
+        assert conflicts[0]["technologies"] == ["Drupal", "WordPress"]
+
+    def test_low_confidence_detections_do_not_raise_a_conflict(self):
+        assert tf.detect_detection_conflicts([
+            self._det("WordPress", tf.CATEGORY_CMS, tf.CONFIDENCE_HIGH),
+            self._det("Drupal", tf.CATEGORY_CMS, tf.CONFIDENCE_LOW)]) == []
+
+    def test_single_cms_plus_framework_is_not_a_conflict(self):
+        assert tf.detect_detection_conflicts([
+            self._det("WordPress", tf.CATEGORY_CMS, tf.CONFIDENCE_HIGH),
+            self._det("Express", tf.CATEGORY_FRAMEWORK, tf.CONFIDENCE_HIGH)]) == []
+
+    def test_multiple_servers_is_a_conflict(self):
+        conflicts = tf.detect_detection_conflicts([
+            self._det("Nginx", tf.CATEGORY_SERVER, tf.CONFIDENCE_MEDIUM),
+            self._det("Apache", tf.CATEGORY_SERVER, tf.CONFIDENCE_MEDIUM)])
+        assert conflicts[0]["kind"] == "multiple_server_detected"
+
+    def test_conflicts_reach_the_summary_and_every_persisted_finding(self, tmp_path):
+        body = (b'<html>wp-content/ wp-includes/ wp-json '
+                b'/sites/default/files/ Drupal.settings /sites/all/modules/</html>')
+        response = _fake_response(status_code=200, body=body)
+        with mock.patch("requests.get", return_value=response):
+            result = tf.run_tech_fingerprint(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "o"),
+                check_favicon=False, probe_known_paths_enabled=False)
+        assert result["conflicts"] and result["conflicts"][0]["kind"] == "multiple_cms_detected"
+        wp = next(d for d in result["technology_summary"]["detections"] if d["technology"] == "WordPress")
+        assert "Drupal" in wp["conflicts_with"]
+        records = json.loads((tmp_path / "o" / "pending_assets.json").read_text())
+        detected = [r for r in records if r["type"] == "tech_fingerprint_detected"]
+        assert all(r["metadata"]["conflicts_with"] for r in detected)
+        json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# D9 — evidence vs. origin attribution (intermediaries / caches)
+# ---------------------------------------------------------------------------
+
+class TestIntermediaryAttribution:
+    def test_intermediary_headers_are_reported(self):
+        info = tf.detect_intermediaries({"Via": "1.1 varnish", "X-Cache": "HIT", "Age": "120"})
+        assert info["observed"] is True
+        assert info["cache_status"] == "HIT"
+        assert info["age"] == "120"
+
+    def test_no_intermediary_headers_reports_nothing(self):
+        info = tf.detect_intermediaries({"Server": "nginx"})
+        assert info["observed"] is False and info["note"] is None
+
+    def test_server_detection_behind_a_cdn_is_marked_as_possibly_edge(self, tmp_path):
+        response = _fake_response(status_code=200,
+                                   headers={"Server": "nginx/1.18.0", "CF-RAY": "abc", "X-Cache": "HIT"},
+                                   body=b"<html>plain</html>")
+        with mock.patch("requests.get", return_value=response):
+            result = tf.run_tech_fingerprint(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "o"),
+                check_favicon=False, probe_known_paths_enabled=False)
+        nginx = next(d for d in result["technology_summary"]["detections"] if d["technology"] == "Nginx")
+        assert nginx["observed_through_intermediary"] is True
+        assert nginx["cache_status"] == "HIT"
+        assert any("may belong to the edge" in e for e in nginx["evidence"])
+        # Confidence is unchanged: no invented numeric penalty.
+        assert nginx["confidence"] == tf.CONFIDENCE_MEDIUM
+
+    def test_direct_response_carries_no_attribution_note(self, tmp_path):
+        response = _fake_response(status_code=200, headers={"Server": "nginx/1.18.0"},
+                                   body=b"<html>plain</html>")
+        with mock.patch("requests.get", return_value=response):
+            result = tf.run_tech_fingerprint(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "o"),
+                check_favicon=False, probe_known_paths_enabled=False)
+        nginx = next(d for d in result["technology_summary"]["detections"] if d["technology"] == "Nginx")
+        assert nginx["observed_through_intermediary"] is False
+        assert not any("ATTRIBUTION" in e for e in nginx["evidence"])
+
+
+# ---------------------------------------------------------------------------
+# D10 — resource safety
+# ---------------------------------------------------------------------------
+
+class _BombRaw:
+    """A urllib3-like raw stream whose decoded output dwarfs the requested amount."""
+
+    def __init__(self, ratio=1000, total_decoded=200 * 1024 * 1024):
+        self.ratio, self.remaining, self.served = ratio, total_decoded, 0
+        self.headers = mock.MagicMock()
+        self.headers.getlist.return_value = []
+
+    def read(self, amt, decode_content=True):
+        if self.remaining <= 0:
+            return b""
+        produced = min(amt * self.ratio, self.remaining)
+        self.remaining -= produced
+        self.served += produced
+        return b"A" * produced
+
+
+class TestResourceSafety:
+    def test_compressed_response_read_is_bounded(self):
+        # Pre-fix, read(max_body_bytes + 1) on a gzip response decompressed the
+        # whole payload first: a 203 KB body declaring 200 MB peaked at 270 MB.
+        resp = mock.MagicMock()
+        resp.headers = {"Content-Encoding": "gzip"}
+        resp.raw = _BombRaw()
+        raw, err = tf._read_bounded_body(resp, tf.DEFAULT_MAX_BODY_BYTES)
+        assert err is None
+        assert len(raw) <= tf.DEFAULT_MAX_BODY_BYTES + 1
+        # At most one chunk's worth of expansion was ever materialised.
+        assert resp.raw.served <= tf.DEFAULT_MAX_BODY_BYTES + 1 + tf._DECODE_CHUNK_BYTES * 1000
+
+    def test_identity_response_keeps_the_single_bounded_read(self):
+        resp = mock.MagicMock()
+        resp.headers = {}
+        resp.raw.read.return_value = b"x" * 50
+        raw, err = tf._read_bounded_body(resp, tf.DEFAULT_MAX_BODY_BYTES)
+        assert raw == b"x" * 50 and err is None
+        resp.raw.read.assert_called_once_with(tf.DEFAULT_MAX_BODY_BYTES + 1, decode_content=True)
+
+    def test_body_read_failure_is_reported_not_silently_empty(self):
+        resp = mock.MagicMock()
+        resp.headers = {"Content-Encoding": "gzip"}
+        resp.raw.read.side_effect = ValueError("bad gzip")
+        type(resp).content = mock.PropertyMock(side_effect=ValueError("bad gzip"))
+        raw, err = tf._read_bounded_body(resp, 1024)
+        assert raw == b"" and "bad gzip" in err
+
+    def test_evidence_volume_is_capped_and_the_cap_is_disclosed(self):
+        capped = tf._cap_evidence([f"e{i}" for i in range(200)])
+        assert len(capped) == tf.DEFAULT_MAX_EVIDENCE_PER_DETECTION
+        assert "further evidence entries omitted" in capped[-1]
+
+    def test_evidence_under_the_cap_is_untouched(self):
+        evidence = [f"e{i}" for i in range(tf.DEFAULT_MAX_EVIDENCE_PER_DETECTION)]
+        assert tf._cap_evidence(evidence) == evidence
+
+    def test_hostile_cookie_flood_produces_a_small_finding(self):
+        names = tf.parse_cookie_names([f"wordpress_{i}=v" for i in range(500)])
+        scan = tf.detect_technologies_from_content({}, names, "", "b")
+        finding = tf.make_tech_finding("WordPress", tf.CATEGORY_CMS, None,
+                                        scan["WordPress"]["evidence"], tf.CONFIDENCE_LOW, SAFE_TARGET)
+        assert len(json.dumps(finding)) < 4096
+
+
+# ---------------------------------------------------------------------------
+# D11 — persistence robustness
+# ---------------------------------------------------------------------------
+
+class TestPersistenceRobustness:
+    def test_unusable_output_directory_raises_persistence_error(self, tmp_path):
+        readonly = tmp_path / "ro"
+        readonly.mkdir()
+        os.chmod(readonly, 0o500)
+        try:
+            with pytest.raises(tf.PersistenceError):
+                tf.PendingAssetsStore(output_dir=str(readonly / "out"))
+        finally:
+            os.chmod(readonly, 0o700)
+
+    def test_run_degrades_instead_of_crashing_when_persistence_is_unavailable(self, tmp_path):
+        readonly = tmp_path / "ro"
+        readonly.mkdir()
+        os.chmod(readonly, 0o500)
+        response = _fake_response(status_code=200, headers={"Server": "nginx/1.18.0"},
+                                   body=b"<html>wp-content/ wp-includes/ wp-json</html>")
+        try:
+            with mock.patch("requests.get", return_value=response):
+                result = tf.run_tech_fingerprint(
+                    SAFE_URL, target=SAFE_TARGET, output_dir=str(readonly / "out"),
+                    check_favicon=False, probe_known_paths_enabled=False)
+        finally:
+            os.chmod(readonly, 0o700)
+        assert result["persistence_available"] is False
+        assert any(e["stage"] == "persistence_init" for e in result["errors"])
+        # The reconnaissance itself still completed and is returned to the caller.
+        assert any(d["technology"] == "WordPress" for d in result["technology_summary"]["detections"])
+        assert result["recommended_next_actions"]
+
+    def test_safe_store_add_reports_os_errors_instead_of_raising(self, tmp_path):
+        store = tf.PendingAssetsStore(output_dir=str(tmp_path))
+        os.chmod(tmp_path, 0o500)
+        try:
+            error = tf._safe_store_add(store, tf.make_finding("t", "x", {}, [], tf.CONFIDENCE_LOW))
+        finally:
+            os.chmod(tmp_path, 0o700)
+        assert isinstance(error, str) and error
+
+    def test_concurrent_runs_do_not_lose_findings(self, tmp_path):
+        import concurrent.futures
+        output_dir = str(tmp_path / "o")
+        response = _fake_response(status_code=200, headers={"Server": "nginx/1.18.0"},
+                                   body=b"<html>nothing</html>")
+
+        def _run(_):
+            with mock.patch("requests.get", return_value=response):
+                return tf.run_tech_fingerprint(
+                    SAFE_URL, target=SAFE_TARGET, output_dir=output_dir,
+                    check_favicon=False, probe_known_paths_enabled=False)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(_run, range(8)))
+        records = json.loads((tmp_path / "o" / "pending_assets.json").read_text())
+        # 1 Nginx detection + 3 negative-result categories, per run, none lost.
+        assert len(records) == 8 * 4
+
+
+# ---------------------------------------------------------------------------
+# D12 — favicon hygiene
+# ---------------------------------------------------------------------------
+
+class TestFaviconHygiene:
+    def test_html_soft_404_is_not_hashed_as_a_favicon(self):
+        resp = _fake_response(status_code=200, headers={"Content-Type": "text/html"},
+                               body=b"<html><body>404 not found</body></html>")
+        with mock.patch("requests.get", return_value=resp):
+            result = tf.compute_favicon_hash(SAFE_URL)
+        assert result["status"] == "not_an_icon"
+        assert result["md5"] is None
+
+    def test_html_without_a_content_type_is_still_detected(self):
+        resp = _fake_response(status_code=200, body=b"<!DOCTYPE html><html>nope</html>")
+        with mock.patch("requests.get", return_value=resp):
+            assert tf.compute_favicon_hash(SAFE_URL)["status"] == "not_an_icon"
+
+    def test_icon_without_a_content_type_is_still_hashed(self):
+        resp = _fake_response(status_code=200, body=b"\x00\x00\x01\x00some-icon")
+        with mock.patch("requests.get", return_value=resp):
+            assert tf.compute_favicon_hash(SAFE_URL)["md5"] is not None
+
+    def test_svg_favicon_is_hashed(self):
+        resp = _fake_response(status_code=200, headers={"Content-Type": "image/svg+xml"},
+                               body=b"<svg xmlns='http://www.w3.org/2000/svg'></svg>")
+        with mock.patch("requests.get", return_value=resp):
+            assert tf.compute_favicon_hash(SAFE_URL)["md5"] is not None
+
+    def test_no_favicon_observation_is_persisted_for_a_soft_404(self, tmp_path):
+        baseline = _fake_response(status_code=200, body=b"<html>plain</html>")
+        error_page = _fake_response(status_code=404, body=b"")
+        html_favicon = _fake_response(status_code=200, headers={"Content-Type": "text/html"},
+                                       body=b"<html>404</html>")
+        with mock.patch("requests.get", side_effect=_resp_seq(baseline, error_page, html_favicon)):
+            tf.run_tech_fingerprint(SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "o"),
+                                     probe_known_paths_enabled=False)
+        records = json.loads((tmp_path / "o" / "pending_assets.json").read_text())
+        assert not any(r["type"] == "tech_fingerprint_favicon_observed" for r in records)
+
+
+# ---------------------------------------------------------------------------
+# D13 — run summary observability and downstream contract
+# ---------------------------------------------------------------------------
+
+class TestRunSummaryContract:
+    def test_summary_reports_what_was_actually_observed(self, tmp_path):
+        baseline = _fake_response(status_code=200, headers={"Content-Type": "text/html; charset=utf-8"},
+                                   body=b"<html>plain</html>", final_url=SAFE_URL)
+        error_page = _fake_response(status_code=404, body=b"")
+        with mock.patch("requests.get", side_effect=_resp_seq(baseline, error_page)):
+            result = tf.run_tech_fingerprint(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "o"),
+                check_favicon=False, probe_known_paths_enabled=False)
+        assert result["status_code"] == 200
+        assert result["final_url"] == SAFE_URL
+        assert result["content_type"].startswith("text/html")
+        assert result["body_truncated"] is False
+        assert result["baseline_representative"]["representative"] is True
+        assert result["persistence_available"] is True
+        json.dumps(result)
+
+    def test_recommended_actions_carry_their_subject(self):
+        detections = [{"technology": "WordPress", "category": tf.CATEGORY_CMS, "version": None,
+                        "evidence": ["e"], "confidence": tf.CONFIDENCE_HIGH, "url": SAFE_URL,
+                        "corroborating_urls": []}]
+        action = tf.build_recommended_actions(detections, SAFE_TARGET)[0]
+        # `target` was previously accepted and then never used, so the action
+        # reached the orchestrator with no subject at all.
+        assert action["target"] == SAFE_TARGET
+        assert action["url"] == SAFE_URL
+        assert action["confidence"] == tf.CONFIDENCE_HIGH
+
+    def test_parse_cookie_names_skips_non_string_entries(self):
+        assert tf.parse_cookie_names([None, 123, "a=1", {"x": 1}]) == ["a"]
+
+    def test_technology_summary_still_drives_endpoint_discovery_wordlists(self):
+        detections = [{"technology": "WordPress", "category": tf.CATEGORY_CMS, "version": None,
+                        "evidence": ["e"], "confidence": tf.CONFIDENCE_HIGH, "url": SAFE_URL,
+                        "corroborating_urls": ["https://example.com/wp-login.php"],
+                        "conflicts_with": ["Drupal"], "observed_through_intermediary": True,
+                        "cache_status": "HIT", "response_status_code": 200}]
+        summary = tf.build_technology_summary(detections)
+        assert ed.select_wordlists_for_technology(summary) == [("wordpress_paths.txt", "wordpress")]
+
+    def test_derived_requests_are_scope_validated(self, tmp_path):
+        with pytest.raises(tf.ScopeError):
+            tf.run_tech_fingerprint("https://evil.com/", target=SAFE_TARGET,
+                                     output_dir=str(tmp_path / "o"))

@@ -160,6 +160,72 @@ proceed without inventing requirements):
      favicon, error-page probe, known-path corroboration). No new hosts
      are ever contacted. This module discovers technology signals; it
      never exercises or exploits anything it detects.
+  7. Confidence is scored over *distinct signals*, not over repetitions of
+     one signal (see _scan_signature/_merge_scan_maps). Every matched signal
+     carries a source-independent key; evidence for repeated observations is
+     always preserved, but the same underlying signal seen again — the same
+     HTML marker on the error page as on the homepage, a second Set-Cookie
+     matching the same cookie pattern — does not raise the score. context.md
+     §8 raises confidence for "multiple independent converging signals";
+     re-reading one signal is not independent convergence.
+  8. A response's fitness to support a *negative* result is assessed
+     separately from its fitness to support a detection (see
+     assess_response_representativeness). Positive evidence on a 500 page is
+     still evidence; "checked and not found" derived from a redirect stub,
+     an error/block page, an empty body or a truncated body is not, so it is
+     not recorded and the check stays in the honest "not checked" state.
+  9. This module reports what a *response* contained, not what an origin
+     runs. Where the response proves an intermediary was involved (see
+     detect_intermediaries) that fact is attached to the detections as
+     evidence. No fixed numeric confidence penalty is applied for it: the
+     evidence model has no basis for a specific discount, and inventing one
+     would make confidence unexplainable.
+
+LIMITATIONS (known, deliberate, and not silently hidden):
+
+  * No JavaScript execution. Every signal here comes from the raw HTTP
+    response. A single-page application whose framework only becomes visible
+    after hydration, whose bundle is minified/tree-shaken past its version
+    strings, or whose markers are injected at runtime, is invisible to this
+    module. Adding a headless browser would change this module into
+    something else; the gap is real and belongs to js_analyzer.py/
+    screenshot.py territory, not to a silent pretence of coverage. A run
+    that finds nothing therefore records "not checked", not "not present"
+    (implementation decision #8).
+  * Redirects are not followed (allow_redirects=False, deliberate — redirect
+    chains are http_analyzer.py's responsibility). Fingerprinting a URL whose
+    root 301s therefore inspects the redirect stub. That is why a redirect
+    response is classified non-representative and produces no negative-result
+    memory.
+  * Evidence is response-scoped, never origin-scoped. A CDN/WAF/reverse proxy
+    can add, replace or strip every header, cookie and body marker used here,
+    and a cached body can describe a deployment that no longer exists. Where
+    the response proves an intermediary was involved this is recorded
+    (implementation decision #9); where it does not, absence of proof is not
+    proof of a direct origin response.
+  * Deception is only partially detectable. A target that emits a fake
+    `X-Powered-By`, a decoy `/wp-content/` path or a borrowed favicon will be
+    reported as evidence of that technology, because that is what was
+    observed. Contradictions between such signals are surfaced as conflicts
+    (detect_detection_conflicts) rather than resolved.
+  * The signature catalogue covers exactly the products context.md §10 names
+    for this module. openresty, LiteSpeed, Tomcat, Cloudfront-origin servers
+    and everything else are out of catalogue, and their absence from the
+    output is a catalogue gap, not evidence of absence.
+  * No favicon-hash signature database is bundled (implementation decision
+    #3), so favicon matching only works with a caller-supplied map.
+  * Response bodies are inspected up to DEFAULT_MAX_BODY_BYTES. A marker
+    beyond that point is missed, which is why a truncated body also blocks
+    negative-result memory.
+  * pending_assets.json is shared with every other module. Writes from *this*
+    module are serialised per output path within one process, but the file
+    has no cross-process or cross-module lock; coordinating that is
+    core/orchestrator.py's and surface_mapper.py's responsibility.
+  * Contradictory detections are reported with a `conflicts_with` annotation
+    on each finding. surface_mapper.py's `_h_tech_detected` does not yet read
+    that annotation, so a contradictory fingerprint still queues one
+    enumeration opportunity per contradicting technology. That is a
+    surface_mapper.py behaviour, recorded here rather than worked around.
 """
 
 from __future__ import annotations
@@ -197,6 +263,20 @@ DEFAULT_TIMEOUT = 8.0
 DEFAULT_MAX_BODY_BYTES = 131072
 DEFAULT_MAX_FAVICON_BYTES = 65536
 DEFAULT_MAX_KNOWN_PATH_PROBES = 12
+
+# Compressed responses are read in chunks this size (see _read_bounded_body).
+_DECODE_CHUNK_BYTES = 8192
+
+# Hard ceiling on how many evidence strings one detection may carry. Evidence
+# is target-controlled in volume (one entry per matching Set-Cookie name, per
+# matching marker, per probed path), and every entry is persisted to
+# pending_assets.json and re-rendered by report_generator.py.
+DEFAULT_MAX_EVIDENCE_PER_DETECTION = 40
+
+# A version token no real product emits is not evidence, it is target-supplied
+# text (see _plausible_version).
+_MAX_VERSION_COMPONENTS = 4
+_MAX_VERSION_COMPONENT_DIGITS = 5
 
 # Signal-scoring weights (implementation decision #1)
 _SCORE_STRONG = 2
@@ -326,6 +406,33 @@ def make_tech_finding(
 # PendingAssetsStore, duplicated here per modular independence)
 # ---------------------------------------------------------------------------
 
+# One lock per pending_assets.json path, shared by every PendingAssetsStore
+# instance in this process. add() is a read-modify-write of a whole-file JSON
+# array, so a per-instance lock does not serialise anything: run_tech_fingerprint
+# builds a fresh store per call, and eight concurrent runs against one output
+# directory were measured losing 5 of 32 findings to interleaved writes.
+# Cross-process and cross-module interleaving of the shared file remains outside
+# one module's reach (see LIMITATIONS in the module docstring).
+_STORE_LOCKS: Dict[str, threading.Lock] = {}
+_STORE_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for_path(path: str) -> threading.Lock:
+    key = os.path.abspath(path)
+    with _STORE_LOCKS_GUARD:
+        lock = _STORE_LOCKS.get(key)
+        if lock is None:
+            lock = _STORE_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 class PendingAssetsStore:
     """
     Crash-safe, append-oriented persistence for <output_dir>/pending_assets.json.
@@ -339,8 +446,17 @@ class PendingAssetsStore:
     def __init__(self, output_dir: str = "output", filename: str = "pending_assets.json"):
         self.output_dir = output_dir
         self.path = os.path.join(output_dir, filename)
-        self._lock = threading.Lock()
-        os.makedirs(self.output_dir, exist_ok=True)
+        self._lock = _lock_for_path(self.path)
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+        except OSError as exc:
+            # A read-only or otherwise unusable output directory previously
+            # surfaced as a bare PermissionError escaping run_tech_fingerprint
+            # before any check ran. It is a persistence problem and must be
+            # reported as one.
+            raise PersistenceError(
+                f"Cannot create/access output directory {self.output_dir!r}: {exc}"
+            ) from exc
 
     def _read_all(self) -> List[Dict[str, Any]]:
         if not os.path.exists(self.path):
@@ -359,6 +475,10 @@ class PendingAssetsStore:
                 f"Existing pending_assets.json is corrupt and cannot be safely "
                 f"appended to: {exc}"
             ) from exc
+        except OSError as exc:
+            raise PersistenceError(
+                f"Cannot read {self.path!r}: {exc}"
+            ) from exc
 
     def add(self, finding: Dict[str, Any]) -> Dict[str, Any]:
         """Append one finding and persist immediately. Returns the finding."""
@@ -370,16 +490,23 @@ class PendingAssetsStore:
 
     def _atomic_write(self, records: List[Dict[str, Any]]) -> None:
         dir_name = os.path.dirname(self.path) or "."
-        fd, tmp_path = tempfile.mkstemp(prefix=".pending_assets_", dir=dir_name)
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix=".pending_assets_", dir=dir_name)
+        except OSError as exc:
+            raise PersistenceError(
+                f"Cannot create a temporary file next to {self.path!r}: {exc}"
+            ) from exc
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(records, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, self.path)
+        except OSError as exc:
+            _remove_quietly(tmp_path)
+            raise PersistenceError(f"Cannot write {self.path!r}: {exc}") from exc
         except BaseException:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            _remove_quietly(tmp_path)
             raise
 
     def all(self) -> List[Dict[str, Any]]:
@@ -401,6 +528,13 @@ def _safe_store_add(store: Optional["PendingAssetsStore"], finding: Dict[str, An
         return None
     except PersistenceError as exc:
         return str(exc)
+    except OSError as exc:
+        # Anything the store did not already classify (a disk filling up
+        # mid-run, an fsync failure, the directory being removed underneath
+        # the process) previously escaped this helper and aborted the whole
+        # run, discarding every not-yet-persisted detection. It is reported,
+        # not swallowed, and the remaining detections still get their chance.
+        return f"Persistence failed for {finding.get('type')!r}: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +561,11 @@ def parse_cookie_names(set_cookie_headers: List[str]) -> List[str]:
     """Extract just the cookie names from raw Set-Cookie header strings."""
     names: List[str] = []
     for raw in set_cookie_headers or []:
+        # A non-string entry is not a cookie header; it must not abort the
+        # whole cookie scan (this is a public helper and urllib3's getlist is
+        # not the only possible caller).
+        if not isinstance(raw, str):
+            continue
         first = raw.split(";", 1)[0]
         name = first.split("=", 1)[0].strip()
         if name:
@@ -439,6 +578,64 @@ def parse_cookie_names(set_cookie_headers: List[str]) -> List[str]:
 # necessary plumbing — mirrors http_analyzer.py's/endpoint_discovery.py's
 # fetch_url, extended to also return raw bytes for favicon hashing)
 # ---------------------------------------------------------------------------
+
+def _read_bounded_body(resp: Any, max_body_bytes: int) -> Tuple[bytes, Optional[str]]:
+    """
+    Read at most `max_body_bytes` + 1 *decoded* bytes from an already-issued
+    streaming response.
+
+    `urllib3.HTTPResponse.read(amt, decode_content=True)` treats `amt` as a
+    count of **compressed** bytes and returns the decompressed result, so a
+    single `read(max_body_bytes + 1)` against a `Content-Encoding: gzip`
+    response materialises the entire decompressed payload before the cap is
+    ever applied. Measured: a 203 KB gzip body declaring 200 MB of content
+    peaked at 270 MB of allocation inside one fetch_url call, and this module
+    issues up to 15 fetches per run.
+
+    Compressed responses are therefore drained in small *compressed* chunks
+    and abandoned as soon as enough decoded bytes are in hand, which bounds
+    peak allocation to roughly one chunk's expansion. Identity-encoded
+    responses (the overwhelming majority) keep the original single bounded
+    read — with no decoder in the path, `amt` is already a decoded-byte cap,
+    so nothing about their behaviour changes.
+    """
+    limit = max_body_bytes + 1
+    encoding = ""
+    try:
+        encoding = str(_ci_get(dict(resp.headers or {}), "Content-Encoding") or "").strip().lower()
+    except Exception:
+        encoding = ""
+
+    first_error: Optional[str] = None
+    if encoding in ("", "identity"):
+        try:
+            return resp.raw.read(limit, decode_content=True) or b"", None
+        except Exception as exc:
+            first_error = f"{type(exc).__name__}: {exc}"
+    else:
+        try:
+            chunks: List[bytes] = []
+            total = 0
+            while total < limit:
+                chunk = resp.raw.read(_DECODE_CHUNK_BYTES, decode_content=True)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            return b"".join(chunks)[:limit], None
+        except Exception as exc:
+            first_error = f"{type(exc).__name__}: {exc}"
+
+    # Last resort only: resp.content materialises the whole (decompressed)
+    # body, so it is reached only when the bounded reads above failed.
+    try:
+        return resp.content[:limit], first_error
+    except Exception as exc:
+        # An undecodable body (e.g. a response that declares
+        # `Content-Encoding: gzip` and then sends plain text) must not look
+        # like an empty page that was successfully inspected.
+        return b"", first_error or f"{type(exc).__name__}: {exc}"
+
 
 def fetch_url(
     url: str,
@@ -454,7 +651,7 @@ def fetch_url(
     result: Dict[str, Any] = {
         "status": "error", "status_code": None, "headers": {}, "set_cookie_headers": [],
         "body": None, "body_bytes": b"", "body_truncated": False, "final_url": url,
-        "elapsed_seconds": None, "error": None,
+        "elapsed_seconds": None, "error": None, "body_error": None,
     }
     req_headers = {"User-Agent": DEFAULT_USER_AGENT}
     if headers:
@@ -463,10 +660,7 @@ def fetch_url(
     resp = None
     try:
         resp = requests.get(url, timeout=timeout, headers=req_headers, allow_redirects=False, stream=True)
-        try:
-            raw = resp.raw.read(max_body_bytes + 1, decode_content=True)
-        except Exception:
-            raw = resp.content[:max_body_bytes + 1]
+        raw, body_error = _read_bounded_body(resp, max_body_bytes)
         truncated = len(raw) > max_body_bytes
         body_bytes = raw[:max_body_bytes]
         try:
@@ -490,6 +684,7 @@ def fetch_url(
             "body_truncated": truncated,
             "final_url": resp.url,
             "elapsed_seconds": resp.elapsed.total_seconds(),
+            "body_error": body_error,
         })
     except requests.exceptions.Timeout:
         result["error"] = "timeout"
@@ -515,10 +710,13 @@ def _rx(pattern: str) -> "re.Pattern[str]":
 
 # 1. Servers (context.md: Nginx, Apache, IIS, Caddy)
 _SERVER_SIGNATURES: List[Dict[str, Any]] = [
-    {"name": "Nginx", "regex": _rx(r"nginx(?:/([\d]+(?:\.[\d]+)*))?")},
-    {"name": "Apache", "regex": _rx(r"apache(?:/([\d]+(?:\.[\d]+)*))?")},
-    {"name": "Microsoft IIS", "regex": _rx(r"microsoft-iis(?:/([\d]+(?:\.[\d]+)*))?")},
-    {"name": "Caddy", "regex": _rx(r"caddy(?:/([\d]+(?:\.[\d]+)*))?")},
+    # The trailing (?![\w-]) guard is load-bearing: without it "Apache-Coyote/1.1"
+    # (Tomcat's connector) was reported as Apache, and any "<product>-nginx"-style
+    # token was reported as Nginx.
+    {"name": "Nginx", "regex": _rx(r"\bnginx(?:/(\d+(?:\.\d+)*))?(?![\w-])")},
+    {"name": "Apache", "regex": _rx(r"\bapache(?:/(\d+(?:\.\d+)*))?(?![\w-])")},
+    {"name": "Microsoft IIS", "regex": _rx(r"\bmicrosoft-iis(?:/(\d+(?:\.\d+)*))?(?![\w-])")},
+    {"name": "Caddy", "regex": _rx(r"\bcaddy(?:/(\d+(?:\.\d+)*))?(?![\w-])")},
 ]
 
 # 2. WAFs (context.md: Cloudflare, Akamai, AWS WAF, F5, Imperva). Each
@@ -687,7 +885,11 @@ _TECH_SIGNATURES: List[Dict[str, Any]] = [
         "name": "React", "category": CATEGORY_FRAMEWORK,
         "meta_generator_product": None,
         "version_attr_regex": None,
-        "html_markers": ["data-reactroot", "_reactrootcontainer", "react-dom"],
+        # Bare "react-dom" matched any page that merely *mentions* the package
+        # (documentation, a changelog, a job ad). Requiring a bundle/URL
+        # delimiter keeps every real script reference — "/react-dom.production
+        # .min.js", "react-dom@18/umd/...", "react-dom/client" — and drops prose.
+        "html_markers": ["data-reactroot", "_reactrootcontainer", _rx(r"react-dom[@./\"']")],
         "cookie_patterns": [],
         "header_markers": {},
         "header_version_regex": None,
@@ -697,7 +899,10 @@ _TECH_SIGNATURES: List[Dict[str, Any]] = [
         "name": "Angular", "category": CATEGORY_FRAMEWORK,
         "meta_generator_product": None,
         "version_attr_regex": _rx(r'ng-version=["\'](\d+(?:\.\d+)*)["\']'),
-        "html_markers": ["ng-version", "ng-app"],
+        # "ng-app" as a bare substring matched ordinary words such as
+        # "training-app" and "booking-app"; it is an HTML attribute, so it is
+        # matched as one.
+        "html_markers": ["ng-version", _rx(r"<[^<>]{0,200}\bng-app\b")],
         "cookie_patterns": [],
         "header_markers": {},
         "header_version_regex": None,
@@ -707,7 +912,10 @@ _TECH_SIGNATURES: List[Dict[str, Any]] = [
         "name": "Vue", "category": CATEGORY_FRAMEWORK,
         "meta_generator_product": None,
         "version_attr_regex": None,
-        "html_markers": ["data-v-", "__vue__", "__nuxt__"],
+        # Vue's scoped-style attribute is "data-v-<hash>"; the bare "data-v-"
+        # prefix also matched any custom "data-v-model"/"data-view" style
+        # attribute, including inside JSON API responses.
+        "html_markers": [_rx(r"data-v-[0-9a-f]{6,10}\b"), "__vue__", "__nuxt__"],
         "cookie_patterns": [],
         "header_markers": {},
         "header_version_regex": None,
@@ -739,10 +947,11 @@ def detect_servers(headers: Dict[str, str]) -> Dict[str, Any]:
         m = sig["regex"].search(value)
         if not m:
             continue
-        version = m.group(1) if m.groups() and m.group(1) else None
+        version = _plausible_version(m.group(1)) if m.groups() and m.group(1) else None
         scan[sig["name"]] = {
             "category": CATEGORY_SERVER,
             "evidence": [f"Server header value {value!r} matches {sig['name']}"],
+            "signals": {f"server_header:{sig['name']}": _SCORE_STRONG},
             "score": _SCORE_STRONG,
             "version": version,
         }
@@ -756,35 +965,49 @@ def detect_servers(headers: Dict[str, str]) -> Dict[str, Any]:
 def detect_wafs(headers: Dict[str, str], set_cookie_headers: Optional[List[str]], body: Optional[str]) -> Dict[str, Any]:
     """Passive WAF signature matching against headers/cookies/body of an already-fetched response."""
     lower_headers = {k.lower(): (v or "") for k, v in (headers or {}).items()}
-    cookies_text = " ".join(set_cookie_headers or []).lower()
+    # Cookie markers are matched against cookie NAMES only. Matching the whole
+    # raw Set-Cookie string meant any cookie whose *value* happened to contain
+    # "akamai", "ts01" or "incap_ses" produced a WAF detection — reproduced
+    # with `pref=my-akamai-favourite-thing` (Akamai) and `sid=ts01abcdef` (F5).
+    cookie_names_lower = [n.lower() for n in parse_cookie_names(set_cookie_headers or [])]
     body_lower = (body or "").lower()
 
     scan: Dict[str, Any] = {}
     for vendor, sig in _WAF_SIGNATURES.items():
         evidence: List[str] = []
-        score = 0
+        signals: Dict[str, int] = {}
+
+        def record(key: str, weight: int, text: str) -> None:
+            evidence.append(text)
+            signals[key] = max(signals.get(key, 0), weight)
+
         for header_name, (weight, subs) in sig["headers"].items():
             value = lower_headers.get(header_name)
             if value is None:
                 continue
             if subs is None:
-                evidence.append(f"header {header_name!r} present: {value!r}")
-                score += weight
+                record(f"waf_header:{header_name}", weight,
+                        f"header {header_name!r} present: {value!r}")
             else:
                 for sub in subs:
                     if sub in value.lower():
-                        evidence.append(f"header {header_name!r} contains {sub!r}")
-                        score += weight
+                        record(f"waf_header:{header_name}:{sub}", weight,
+                                f"header {header_name!r} contains {sub!r}")
         for weight, marker in sig["cookies"]:
-            if marker in cookies_text:
-                evidence.append(f"Set-Cookie contains marker {marker!r}")
-                score += weight
+            matched = [n for n in cookie_names_lower if marker in n]
+            if matched:
+                shown = ", ".join(repr(n) for n in matched[:5])
+                if len(matched) > 5:
+                    shown += f" (+{len(matched) - 5} more)"
+                record(f"waf_cookie:{marker}", weight,
+                        f"Set-Cookie name(s) {shown} contain marker {marker!r}")
         for weight, marker in sig["body"]:
             if marker in body_lower:
-                evidence.append(f"response body contains marker {marker!r}")
-                score += weight
+                record(f"waf_body:{marker}", weight,
+                        f"response body contains marker {marker!r}")
         if evidence:
-            scan[vendor] = {"category": CATEGORY_WAF, "evidence": evidence, "score": score, "version": None}
+            scan[vendor] = {"category": CATEGORY_WAF, "evidence": evidence,
+                             "signals": signals, "score": sum(signals.values()), "version": None}
     return scan
 
 
@@ -792,86 +1015,224 @@ def detect_wafs(headers: Dict[str, str], set_cookie_headers: Optional[List[str]]
 # 3. CMS + framework signature detection (headers/cookies/HTML/JS/URLs)
 # ---------------------------------------------------------------------------
 
-def _extract_meta_generator(body: str, product_name: str) -> Tuple[Optional[str], Optional[str]]:
+# `<meta ...>` tag scanner. `[^<>]` (not `[^>]`) is deliberate: with `[^>]`,
+# a body consisting of many `<meta ` tokens lets the engine consume the
+# remainder of the body from every candidate start position and backtrack —
+# measured at 21.3 s for one 128 KB body, i.e. ~25 s per signature scan and
+# ~50 s per run, from a single HTTP response. Excluding `<` confines each
+# attempt to one tag, and the bounded repetition caps one pathological tag.
+_META_TAG_RE = re.compile(r"<meta\b([^<>]{0,4096})>", re.IGNORECASE)
+_ATTR_RE = re.compile(
+    r"""([a-zA-Z_:][-\w:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+))"""
+)
+
+
+def _meta_attrs(tag_body: str) -> Dict[str, str]:
+    """Parse one `<meta ...>` tag's attributes (first occurrence of each name wins)."""
+    attrs: Dict[str, str] = {}
+    for m in _ATTR_RE.finditer(tag_body):
+        name = m.group(1).lower()
+        if name in attrs:
+            continue
+        value = m.group(2)
+        if value is None:
+            value = m.group(3)
+        if value is None:
+            value = m.group(4) or ""
+        attrs[name] = value
+    return attrs
+
+
+def extract_generator_declarations(body: Optional[str]) -> List[str]:
     """
-    Return (declared_content, version) if a <meta name="generator"
-    content="..."> tag mentions `product_name`, else (None, None). Version
-    is only returned when a numeric version token is actually present in
-    the declared content — never invented.
+    Return the `content` of every `<meta name="generator">` tag in document
+    order, regardless of attribute order.
+
+    The previous single regex required `content=` to appear *after* `name=`,
+    so the equally valid `<meta content="WordPress 6.4.2" name="generator">`
+    produced no detection at all.
     """
-    pattern = _rx(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']*)["\']')
-    for m in pattern.finditer(body or ""):
-        content = m.group(1)
+    declarations: List[str] = []
+    for m in _META_TAG_RE.finditer(body or ""):
+        attrs = _meta_attrs(m.group(1))
+        if attrs.get("name", "").strip().lower() != "generator":
+            continue
+        content = attrs.get("content")
+        if content:
+            declarations.append(content)
+    return declarations
+
+
+def _plausible_version(token: Optional[str]) -> Optional[str]:
+    """
+    Reject version strings no real product emits.
+
+    A version reported by this module is consumed by vuln_intel.py as a fact
+    to match CVEs against, so a target-supplied token such as
+    `ng-version="99999999999999.1.1"` must not be reproduced verbatim as a
+    detected version. Only dotted numeric tokens of at most
+    _MAX_VERSION_COMPONENTS components, each at most
+    _MAX_VERSION_COMPONENT_DIGITS digits, are accepted.
+    """
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) > _MAX_VERSION_COMPONENTS:
+        return None
+    for part in parts:
+        if not part.isdigit() or len(part) > _MAX_VERSION_COMPONENT_DIGITS:
+            return None
+    return token
+
+
+def _version_after_product(content: str, product_name: str) -> Optional[str]:
+    """
+    Extract a version only when a numeric token *immediately follows* the
+    product name in the declared string.
+
+    Scanning the whole declaration for the first number anywhere turned
+    `<meta name="generator" content="Powered by WordPress since 2003">` into
+    a reported "WordPress 2003" — precisely the invented version this
+    module's own contract ("never guesses or infers a version") forbids, and
+    exactly the kind of false precision vuln_intel.py would then look up.
+    """
+    m = re.search(re.escape(product_name) + r"[\s!:_/v-]*?v?(\d+(?:\.\d+)*)", content, re.IGNORECASE)
+    if not m:
+        return None
+    # The token must genuinely follow the name, not sit further along in prose:
+    # re.escape(name) + a short separator run is already anchored, but reject a
+    # match whose separator swallowed a word (e.g. "WordPress since 2003").
+    separator = content[m.start() + len(product_name): m.start(1)]
+    if separator.strip(" \t!:_/-vV"):
+        return None
+    return _plausible_version(m.group(1))
+
+
+def _extract_meta_generator(
+    body: str, product_name: str, declarations: Optional[List[str]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return (declared_content, version) if a `<meta name="generator">` tag
+    mentions `product_name`, else (None, None). Version is only returned when
+    a numeric version token actually follows the product name in the declared
+    content — never invented.
+
+    `declarations` lets a caller that already scanned the body reuse the
+    result: the tag scan is body-wide and was previously re-run once per
+    signature carrying a `meta_generator_product`.
+    """
+    if declarations is None:
+        declarations = extract_generator_declarations(body)
+    for content in declarations:
         if product_name.lower() in content.lower():
-            version_match = re.search(r"(\d+(?:\.\d+)*)", content)
-            return content, (version_match.group(1) if version_match else None)
+            return content, _version_after_product(content, product_name)
     return None, None
 
 
+def _marker_matches(marker: Any, body: str, body_lower: str) -> bool:
+    """
+    Match one html_marker, which may be a plain substring or a compiled
+    pattern. Patterns exist for markers whose bare substring form collides
+    with ordinary prose (see _TECH_SIGNATURES).
+    """
+    if hasattr(marker, "search"):
+        return marker.search(body) is not None
+    return marker.lower() in body_lower
+
+
+def _marker_label(marker: Any) -> str:
+    return marker.pattern if hasattr(marker, "pattern") else str(marker)
+
+
 def _scan_signature(
-    sig: Dict[str, Any], headers: Dict[str, str], cookie_names: List[str], body: Optional[str], source_label: str,
-) -> Optional[Tuple[List[str], int, Optional[str]]]:
+    sig: Dict[str, Any],
+    headers: Dict[str, str],
+    cookie_names: List[str],
+    body: Optional[str],
+    source_label: str,
+    body_lower: Optional[str] = None,
+    generator_declarations: Optional[List[str]] = None,
+) -> Optional[Tuple[List[str], Dict[str, int], Optional[str]]]:
     """
     Match one technology signature against one (headers, cookies, body)
-    triple. Returns (evidence, score, version) if anything matched, else
-    None. Signal weighting: see implementation decision #1 in the module
+    triple. Returns (evidence, signals, version) if anything matched, else
+    None, where `signals` maps each distinct signal key to its weight. Signal weighting: see implementation decision #1 in the module
     docstring.
+
+    Scoring is keyed per *distinct underlying signal* (see
+    implementation decision #7). Two Set-Cookie headers matching the same
+    cookie pattern, or the same HTML marker seen again on the error page,
+    are the same signal observed twice — evidence for both is preserved,
+    but the score is counted once.
     """
     body = body or ""
+    if body_lower is None:
+        body_lower = body.lower()
     evidence: List[str] = []
-    score = 0
+    signals: Dict[str, int] = {}
     version: Optional[str] = None
 
+    def record(key: str, weight: int, text: str) -> None:
+        evidence.append(text)
+        signals[key] = max(signals.get(key, 0), weight)
+
     if sig.get("meta_generator_product"):
-        content, ver = _extract_meta_generator(body, sig["meta_generator_product"])
+        content, ver = _extract_meta_generator(
+            body, sig["meta_generator_product"], declarations=generator_declarations,
+        )
         if content:
-            evidence.append(f"{source_label}: <meta name=\"generator\"> declares {content!r}")
-            score += _SCORE_STRONG
+            record(f"meta_generator:{sig['meta_generator_product']}", _SCORE_STRONG,
+                    f"{source_label}: <meta name=\"generator\"> declares {content!r}")
             version = ver
 
     if sig.get("version_attr_regex"):
         m = sig["version_attr_regex"].search(body)
         if m:
-            evidence.append(f"{source_label}: version attribute matched {m.group(0)!r}")
-            score += _SCORE_STRONG
+            record(f"version_attr:{sig['name']}", _SCORE_STRONG,
+                    f"{source_label}: version attribute matched {m.group(0)!r}")
             if not version:
-                version = m.group(1)
+                version = _plausible_version(m.group(1))
 
     for marker in sig.get("html_markers", []):
-        if marker.lower() in body.lower():
-            evidence.append(f"{source_label}: content contains marker {marker!r}")
-            score += _SCORE_WEAK
+        if _marker_matches(marker, body, body_lower):
+            label = _marker_label(marker)
+            record(f"html:{label}", _SCORE_WEAK,
+                    f"{source_label}: content contains marker {label!r}")
 
     for pattern in sig.get("cookie_patterns", []):
-        for name in cookie_names:
-            if pattern.match(name):
-                evidence.append(f"Set-Cookie name {name!r} matches {sig['name']} cookie pattern")
-                score += _SCORE_WEAK
+        matched_names = [name for name in cookie_names if pattern.match(name)]
+        if matched_names:
+            shown = ", ".join(repr(n) for n in matched_names[:5])
+            if len(matched_names) > 5:
+                shown += f" (+{len(matched_names) - 5} more)"
+            record(f"cookie:{sig['name']}:{pattern.pattern}", _SCORE_WEAK,
+                    f"Set-Cookie name(s) {shown} match {sig['name']} cookie pattern "
+                    f"{pattern.pattern!r}")
 
     for header_name, (weight, subs) in sig.get("header_markers", {}).items():
         value = _ci_get(headers, header_name)
         if value is None:
             continue
         if subs is None:
-            evidence.append(f"header {header_name!r} present: {value!r}")
-            score += weight
+            record(f"header:{header_name}", weight,
+                    f"header {header_name!r} present: {value!r}")
             if sig.get("header_version_regex") and not version:
                 vm = sig["header_version_regex"].search(value)
                 if vm:
-                    version = vm.group(1)
+                    version = _plausible_version(vm.group(1))
         else:
             for sub in subs:
                 if sub.lower() in value.lower():
-                    evidence.append(f"header {header_name!r} contains {sub!r} (value={value!r})")
-                    score += weight
+                    record(f"header:{header_name}:{sub}", weight,
+                            f"header {header_name!r} contains {sub!r} (value={value!r})")
                     if sig.get("header_version_regex") and not version:
                         vm = sig["header_version_regex"].search(value)
                         if vm:
-                            version = vm.group(1)
+                            version = _plausible_version(vm.group(1))
 
     if not evidence:
         return None
-    return evidence, score, version
+    return evidence, signals, version
 
 
 def detect_technologies_from_content(
@@ -880,31 +1241,80 @@ def detect_technologies_from_content(
     """
     Run every CMS/framework signature (responsibility #3) against one
     (headers, cookies, body) source. Returns {tech_name: {"category":,
-    "evidence": [...], "score": int, "version": Optional[str]}}.
+    "evidence": [...], "signals": {key: weight}, "score": int,
+    "version": Optional[str]}}, where `score` is the sum of the *distinct*
+    signal weights (implementation decision #7).
     """
+    body = body or ""
+    # Both are body-wide and were previously recomputed inside every
+    # signature (13 lowercase copies of up to 128 KB, and one full
+    # <meta> scan per generator-carrying signature, per scan source).
+    body_lower = body.lower()
+    generator_declarations = extract_generator_declarations(body)
+
     scan: Dict[str, Any] = {}
     for sig in _TECH_SIGNATURES:
-        result = _scan_signature(sig, headers, cookie_names, body, source_label)
+        result = _scan_signature(
+            sig, headers, cookie_names, body, source_label,
+            body_lower=body_lower, generator_declarations=generator_declarations,
+        )
         if result is None:
             continue
-        evidence, score, version = result
-        scan[sig["name"]] = {"category": sig["category"], "evidence": evidence, "score": score, "version": version}
+        evidence, signals, version = result
+        scan[sig["name"]] = {
+            "category": sig["category"], "evidence": evidence,
+            "signals": signals, "score": sum(signals.values()), "version": version,
+        }
     return scan
 
 
 def _merge_scan_maps(*maps: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Union evidence and sum scores for the same technology across multiple scan sources."""
+    """
+    Union evidence for the same technology across multiple scan sources, and
+    score the union by *distinct signal*, not by repetition.
+
+    The previous implementation summed the per-source scores. Because the
+    baseline scan and the error-page scan run the identical matchers, any
+    site whose 404 page shares the homepage's theme (a WordPress theme
+    footer) or returns the homepage outright (an SPA catch-all) had every
+    marker counted twice, so two genuine weak markers reached HIGH. Measured:
+    a soft-404 site carrying two Magento markers scored 6 (HIGH) on two real
+    signals. Scoring the merged signal set keeps converging *independent*
+    evidence raising confidence (context.md §8) while repeated observation of
+    the same signal no longer does.
+
+    Records without a `signals` map (hand-built maps, and any future caller
+    that builds a scan entry directly) keep the old additive behaviour: each
+    such record contributes its own opaque key.
+    """
     merged: Dict[str, Dict[str, Any]] = {}
-    for m in maps:
+    for index, m in enumerate(maps):
         for name, rec in m.items():
-            if name not in merged:
-                merged[name] = {"category": rec["category"], "evidence": list(rec["evidence"]),
-                                 "score": rec["score"], "version": rec.get("version")}
-            else:
-                merged[name]["evidence"].extend(rec["evidence"])
-                merged[name]["score"] += rec["score"]
-                if not merged[name].get("version") and rec.get("version"):
-                    merged[name]["version"] = rec["version"]
+            entry = merged.get(name)
+            if entry is None:
+                entry = merged[name] = {
+                    "category": rec.get("category"), "evidence": [], "signals": {},
+                    "score": 0, "version": rec.get("version"),
+                    "corroborating_urls": [],
+                }
+            for text in rec.get("evidence", []):
+                if text not in entry["evidence"]:
+                    entry["evidence"].append(text)
+            signals = rec.get("signals")
+            if not signals:
+                signals = {f"_unkeyed:{index}:{name}": rec.get("score", 0)}
+            for key, weight in signals.items():
+                entry["signals"][key] = max(entry["signals"].get(key, 0), weight)
+            for url in rec.get("corroborating_urls", []) or []:
+                if url not in entry["corroborating_urls"]:
+                    entry["corroborating_urls"].append(url)
+            confirmed = rec.get("confirmed_url")
+            if confirmed and confirmed not in entry["corroborating_urls"]:
+                entry["corroborating_urls"].append(confirmed)
+            if not entry.get("version") and rec.get("version"):
+                entry["version"] = rec["version"]
+    for entry in merged.values():
+        entry["score"] = sum(entry["signals"].values())
     return merged
 
 
@@ -930,6 +1340,27 @@ def fetch_error_page_sample(origin: str, timeout: float = DEFAULT_TIMEOUT) -> Di
 # 5. Favicon hashing
 # ---------------------------------------------------------------------------
 
+_MARKUP_PREFIXES = (b"<!doctype", b"<html", b"<?xml", b"<head", b"<body", b"<!--")
+
+
+def _looks_like_markup(content_type: Optional[str], raw: bytes) -> bool:
+    """
+    True when a response is positively identified as HTML/XML rather than an
+    icon. Deliberately conservative — an unknown or absent Content-Type is
+    *not* treated as markup, so servers that serve icons with no/odd
+    Content-Type keep working.
+
+    `<svg` is excluded on purpose: an SVG favicon is a legitimate icon.
+    """
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct in ("text/html", "application/xhtml+xml"):
+        return True
+    if ct.startswith("image/"):
+        return False
+    head = raw[:512].lstrip()[:64].lower()
+    return any(head.startswith(prefix) for prefix in _MARKUP_PREFIXES)
+
+
 def compute_favicon_hash(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> Dict[str, Any]:
     """
     Fetch <origin>/favicon.ico and compute MD5 + SHA-256 of its raw bytes.
@@ -941,7 +1372,8 @@ def compute_favicon_hash(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> Dic
     resp = fetch_url(url, timeout=timeout, max_body_bytes=DEFAULT_MAX_FAVICON_BYTES)
     result: Dict[str, Any] = {
         "status": resp["status"], "url": url, "error": resp.get("error"),
-        "status_code": resp.get("status_code"), "byte_length": 0, "md5": None, "sha256": None,
+        "status_code": resp.get("status_code"), "content_type": None,
+        "byte_length": 0, "md5": None, "sha256": None,
     }
     if resp["status"] != "found" or not resp.get("status_code") or resp["status_code"] >= 400:
         if resp["status"] == "found":
@@ -951,6 +1383,16 @@ def compute_favicon_hash(base_url: str, timeout: float = DEFAULT_TIMEOUT) -> Dic
     raw = resp.get("body_bytes") or b""
     if not raw:
         result["status"] = "empty"
+        return result
+
+    result["content_type"] = _ci_get(resp.get("headers") or {}, "Content-Type")
+    if _looks_like_markup(result["content_type"], raw):
+        # A site that answers /favicon.ico with its HTML soft-404 page has no
+        # favicon. Hashing that page produced a `tech_fingerprint_favicon_observed`
+        # record whose hash is the soft-404 page's, poisoning the stored hash
+        # corpus that exists precisely so a future signature database can be
+        # correlated against it retroactively.
+        result["status"] = "not_an_icon"
         return result
 
     result["byte_length"] = len(raw)
@@ -977,6 +1419,7 @@ def match_favicon_hash(
                 "technology": sig["technology"],
                 "category": sig.get("category", CATEGORY_CMS),
                 "evidence": [f"favicon hash {hash_hex} matched known signature for {sig['technology']}"],
+                "signals": {f"favicon:{hash_hex}": _SCORE_STRONG},
                 "score": _SCORE_STRONG,
                 "version": sig.get("version"),
             }
@@ -988,11 +1431,34 @@ def match_favicon_hash(
 # see module docstring, implementation decision #2)
 # ---------------------------------------------------------------------------
 
+def _catch_all_probe_result(soft_404: Optional[Dict[str, Any]]) -> Tuple[bool, Optional[str]]:
+    """
+    Decide, from the random-path probe already fetched by
+    fetch_error_page_sample(), whether this origin answers *any* path with a
+    success status (an SPA/catch-all router, a soft-404 front controller, or
+    an edge that rewrites every miss).
+
+    Returns (is_catch_all, normalized_body_of_the_catch_all_response).
+    """
+    if not soft_404 or soft_404.get("status") != "found":
+        return False, None
+    code = soft_404.get("status_code")
+    if not isinstance(code, int) or code >= 400 or code in (301, 302, 303, 307, 308):
+        return False, None
+    return True, _normalize_body_for_compare(soft_404.get("body"))
+
+
+def _normalize_body_for_compare(body: Optional[str]) -> str:
+    """Collapse whitespace so two renders of the same shell compare equal."""
+    return " ".join((body or "").split())
+
+
 def probe_known_paths(
     origin: str,
     candidate_names: List[str],
     timeout: float = DEFAULT_TIMEOUT,
     max_probes: int = DEFAULT_MAX_KNOWN_PATH_PROBES,
+    soft_404: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     For each already-signaled technology in `candidate_names` that has a
@@ -1001,10 +1467,26 @@ def probe_known_paths(
     contributes no evidence (absence isn't proof against other signals). A
     non-404 response with a matching content marker is strong evidence; a
     non-404 response with no marker configured is weak evidence.
+
+    `soft_404` is the already-fetched random-path response from
+    fetch_error_page_sample(). It is used as a control, because on an origin
+    that answers every path with 200 a known-path 200 proves nothing:
+
+      * a marker-less known path (Magento's `admin/`, `errors/report.php`)
+        contributes no evidence at all when the origin is a catch-all —
+        previously it contributed weak evidence per path, which took a
+        soft-404 site carrying two generic Magento markers to HIGH; and
+      * any known-path response whose body is identical to the random-path
+        control is the same generic page, so it contributes nothing even
+        when a marker matched — the marker came from the shell, and the
+        baseline scan has already counted it.
+
+    Omitting `soft_404` preserves the original behaviour exactly.
     """
     sig_by_name = {s["name"]: s for s in _TECH_SIGNATURES}
     scan: Dict[str, Any] = {}
     probes_used = 0
+    is_catch_all, catch_all_body = _catch_all_probe_result(soft_404)
 
     for name in candidate_names:
         sig = sig_by_name.get(name)
@@ -1022,20 +1504,32 @@ def probe_known_paths(
                 continue
 
             body = resp.get("body") or ""
+            if is_catch_all and catch_all_body is not None and \
+                    _normalize_body_for_compare(body) == catch_all_body:
+                continue
+
             if marker is not None:
                 if marker.lower() not in body.lower():
                     continue
                 evidence = [f"known path {url} returned HTTP {resp['status_code']} containing marker {marker!r}"]
+                key = f"path:{path}:{marker}"
                 score = _SCORE_STRONG
             else:
+                if is_catch_all:
+                    continue
                 evidence = [f"known path {url} returned HTTP {resp['status_code']} (no content marker configured)"]
+                key = f"path:{path}"
                 score = _SCORE_WEAK
 
-            entry = scan.setdefault(name, {"category": sig["category"], "evidence": [], "score": 0,
-                                            "version": None, "confirmed_url": None})
+            entry = scan.setdefault(name, {"category": sig["category"], "evidence": [], "signals": {},
+                                            "score": 0, "version": None, "confirmed_url": None,
+                                            "corroborating_urls": []})
             entry["evidence"].extend(evidence)
-            entry["score"] += score
+            entry["signals"][key] = max(entry["signals"].get(key, 0), score)
+            entry["score"] = sum(entry["signals"].values())
             entry["confirmed_url"] = url
+            if url not in entry["corroborating_urls"]:
+                entry["corroborating_urls"].append(url)
 
     return scan
 
@@ -1052,20 +1546,53 @@ def _confidence_for_score(score: int) -> str:
     return CONFIDENCE_LOW
 
 
+def _cap_evidence(evidence: List[str], limit: int = DEFAULT_MAX_EVIDENCE_PER_DETECTION) -> List[str]:
+    """
+    Bound one detection's evidence list, never silently.
+
+    Evidence volume is target-controlled (one entry per matching cookie name,
+    marker and probed path) and every entry is persisted to
+    pending_assets.json and re-rendered downstream, so the overflow is
+    reported rather than dropped without trace.
+    """
+    if len(evidence) <= limit:
+        return list(evidence)
+    kept = list(evidence[: limit - 1])
+    kept.append(f"[{len(evidence) - (limit - 1)} further evidence entries omitted "
+                f"— evidence volume capped at {limit} per detection]")
+    return kept
+
+
 def _finalize_detections(scan: Dict[str, Dict[str, Any]], base_url: str) -> List[Dict[str, Any]]:
-    """Turn a merged scan map into a sorted list of final detection dicts (technology/category/version/evidence/confidence/url)."""
+    """
+    Turn a merged scan map into a sorted list of final detection dicts
+    (technology/category/version/evidence/confidence/url).
+
+    `url` is deliberately the URL that was fingerprinted, not a corroborating
+    probe path: surface_mapper.py keys a technology asset by
+    (scope_url, technology), so emitting `https://host/wp-login.php` for a
+    corroborated run and `https://host/` for an uncorroborated one split the
+    same WordPress install into two technology assets, duplicating the
+    downstream enumeration opportunity. The corroborating paths are preserved
+    in their own field instead of being folded into asset identity.
+    """
     detections = []
     for name in sorted(scan):
         rec = scan[name]
         if rec["score"] <= 0:
             continue
+        corroborating = list(rec.get("corroborating_urls") or [])
+        confirmed = rec.get("confirmed_url")
+        if confirmed and confirmed not in corroborating:
+            corroborating.append(confirmed)
         detections.append({
             "technology": name,
             "category": rec["category"],
             "version": rec.get("version"),
-            "evidence": rec["evidence"],
+            "evidence": _cap_evidence(rec["evidence"]),
             "confidence": _confidence_for_score(rec["score"]),
-            "url": rec.get("confirmed_url") or base_url,
+            "url": base_url,
+            "corroborating_urls": corroborating,
         })
     return detections
 
@@ -1133,8 +1660,13 @@ def build_recommended_actions(detections: List[Dict[str, Any]], target: str) -> 
         actions.append({
             "action": "endpoint_discovery.run_endpoint_discovery",
             "target_module": "endpoint_discovery.py",
+            # Without these the orchestrator receives an action with no subject:
+            # `target` was accepted by this function and then never used.
+            "target": target,
+            "url": d.get("url"),
             "technology": d["technology"],
             "category": d["category"],
+            "confidence": d["confidence"],
             "reason": note,
             "justification": (
                 f"[REASON: {d['technology']} fingerprinted with {d['confidence']} confidence "
@@ -1147,14 +1679,178 @@ def build_recommended_actions(detections: List[Dict[str, Any]], target: str) -> 
 
 
 # ---------------------------------------------------------------------------
+# Response representativeness, intermediary attribution, conflict detection
+# ---------------------------------------------------------------------------
+
+# Headers that prove the observed response passed through (or was produced by)
+# a cache/CDN/proxy rather than coming straight from the origin application.
+_INTERMEDIARY_HEADERS = (
+    "via", "x-cache", "x-cache-hits", "age", "cf-ray", "cf-cache-status",
+    "x-served-by", "x-amz-cf-id", "x-amz-cf-pop", "x-varnish", "x-fastly-request-id",
+    "x-akamai-transformed", "x-azure-ref", "x-iinfo", "x-cdn",
+)
+
+
+def assess_response_representativeness(fetch_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Decide whether a fetched response is a fair basis for the statement
+    "this technology is not present".
+
+    context.md §8's negative-result memory records a *completed* check so
+    other modules can skip repeating it. Recording "checked and not found"
+    from a 301 stub, a WAF block page, a 5xx, an empty body or a truncated
+    body turns a failed observation into an asserted absence — the exact
+    failure-becomes-absence error. Detections are unaffected: a Laravel
+    "Whoops" 500 page is excellent positive evidence, it is just not proof of
+    anything's absence.
+    """
+    reasons: List[str] = []
+    status_code = fetch_result.get("status_code")
+    body = fetch_result.get("body") or ""
+    headers = fetch_result.get("headers") or {}
+
+    if fetch_result.get("status") != "found":
+        reasons.append(f"request did not complete ({fetch_result.get('error')})")
+    if not isinstance(status_code, int):
+        reasons.append("no HTTP status code observed")
+    elif 300 <= status_code < 400:
+        reasons.append(f"HTTP {status_code} redirect stub — the represented content lives elsewhere")
+    elif status_code >= 400:
+        reasons.append(f"HTTP {status_code} error/blocked response — origin content was not served")
+    if fetch_result.get("body_error"):
+        reasons.append(f"response body could not be read/decoded ({fetch_result['body_error']})")
+    if not body.strip() and not _ci_get(headers, "Server") and not _ci_get(headers, "X-Powered-By"):
+        reasons.append("empty body and no identifying response headers")
+    if fetch_result.get("body_truncated"):
+        reasons.append(f"body truncated at {DEFAULT_MAX_BODY_BYTES} bytes — the remainder was not inspected")
+
+    return {
+        "representative": not reasons,
+        "reasons": reasons,
+        "status_code": status_code,
+        "content_type": _ci_get(headers, "Content-Type"),
+        "body_truncated": bool(fetch_result.get("body_truncated")),
+        "final_url": fetch_result.get("final_url"),
+    }
+
+
+def detect_intermediaries(headers: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Report whether the response demonstrably passed through a cache/CDN/proxy.
+
+    This module can observe "this response contains evidence of technology X".
+    It cannot observe "the origin runs technology X" — an edge can add,
+    replace or strip every signal it uses, and a cached response may describe
+    a deployment that no longer exists. Where the response itself says an
+    intermediary was involved, that is recorded as evidence rather than
+    guessed at, and no numeric confidence penalty is invented for it.
+    """
+    present = [h for h in _INTERMEDIARY_HEADERS if _ci_get(headers, h) is not None]
+    cache_status = _ci_get(headers, "X-Cache") or _ci_get(headers, "CF-Cache-Status")
+    age = _ci_get(headers, "Age")
+    return {
+        "observed": bool(present),
+        "headers": present,
+        "cache_status": cache_status,
+        "age": age,
+        "note": (
+            "Response demonstrably traversed a cache/CDN/proxy: header-derived "
+            "evidence may describe the intermediary rather than the origin, and "
+            "a cached body may predate the current deployment."
+        ) if present else None,
+    }
+
+
+# Only one of these can be the CMS serving a given URL, so more than one at
+# MEDIUM+ is a contradiction worth surfacing rather than four confident answers.
+_MUTUALLY_EXCLUSIVE_CATEGORIES = (CATEGORY_CMS, CATEGORY_SERVER)
+
+
+def detect_detection_conflicts(detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Surface contradictions *within* one fingerprint (context.md §8, conflict
+    preservation).
+
+    Nothing is dropped or downgraded — a host genuinely can front two
+    products, and preserving both is the architecture's rule. What was
+    missing was any signal that they contradict each other: a soft-404 origin
+    echoing four CMS marker sets produced four HIGH-confidence CMS detections
+    and, once ingested, four separate `technology_specific_enumeration`
+    opportunities, with `conflicts` empty in the graph.
+    """
+    conflicts: List[Dict[str, Any]] = []
+    for category in _MUTUALLY_EXCLUSIVE_CATEGORIES:
+        names = sorted({
+            d["technology"] for d in detections
+            if d["category"] == category and d["confidence"] in (CONFIDENCE_MEDIUM, CONFIDENCE_HIGH)
+        })
+        if len(names) > 1:
+            conflicts.append({
+                "kind": f"multiple_{category}_detected",
+                "category": category,
+                "technologies": names,
+                "explanation": (
+                    f"{len(names)} distinct {category} products were fingerprinted on the same URL "
+                    f"({', '.join(names)}). Possible explanations: several applications behind one "
+                    f"hostname, a reverse proxy or CDN contributing its own signature, a catch-all/"
+                    f"soft-404 origin echoing unrelated markers, or deliberately planted decoy "
+                    f"signatures. All detections are preserved; none is authoritative on its own."
+                ),
+            })
+    return conflicts
+
+
+def annotate_detections(
+    detections: List[Dict[str, Any]],
+    intermediary: Dict[str, Any],
+    conflicts: List[Dict[str, Any]],
+    representativeness: Dict[str, Any],
+) -> None:
+    """Attach observation context to each detection, in place."""
+    conflicting: Dict[str, List[str]] = {}
+    for conflict in conflicts:
+        for name in conflict["technologies"]:
+            conflicting.setdefault(name, []).extend(n for n in conflict["technologies"] if n != name)
+
+    for d in detections:
+        d["observed_through_intermediary"] = bool(intermediary.get("observed"))
+        d["cache_status"] = intermediary.get("cache_status")
+        d["response_status_code"] = representativeness.get("status_code")
+        d["conflicts_with"] = sorted(set(conflicting.get(d["technology"], [])))
+        if intermediary.get("observed") and d["category"] in (CATEGORY_SERVER, CATEGORY_WAF):
+            d["evidence"] = list(d["evidence"]) + [
+                f"ATTRIBUTION: response traversed an intermediary "
+                f"({', '.join(intermediary['headers'])}) — this {d['category']} signature may belong "
+                f"to the edge rather than to the origin."
+            ]
+        elif intermediary.get("observed"):
+            d["evidence"] = list(d["evidence"]) + [
+                f"ATTRIBUTION: response traversed an intermediary "
+                f"({', '.join(intermediary['headers'])}); cached or edge-rewritten content can carry "
+                f"signals the current origin no longer emits."
+            ]
+
+
+# ---------------------------------------------------------------------------
 # Negative-result memory (context.md §8/§12.6)
 # ---------------------------------------------------------------------------
 
 def persist_no_match_findings(
     categories_with_detections: set, target: str, url: str, store: Optional[PendingAssetsStore],
+    observation: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
-    """Persist a negative-result-memory finding for every category with zero detections."""
+    """
+    Persist a negative-result-memory finding for every category with zero
+    detections.
+
+    `observation` carries the audit trail of *what was actually inspected*
+    (HTTP status, content type, whether the body was truncated, which probe
+    stages ran) so a downstream consumer can tell a thorough negative from a
+    thin one. Whether a negative may be recorded at all is decided by the
+    caller via assess_response_representativeness().
+    """
     errors: List[str] = []
+    observation = observation or {}
     for category in (CATEGORY_CMS, CATEGORY_FRAMEWORK, CATEGORY_SERVER, CATEGORY_WAF):
         if category in categories_with_detections:
             continue
@@ -1162,10 +1858,12 @@ def persist_no_match_findings(
             finding_type="tech_fingerprint_checked_no_match",
             target=target,
             value={"category": category, "url": url},
-            evidence=[f"No {category} signature matched headers/cookies/HTML/error-page content for {url}"],
+            evidence=[f"No {category} signature matched headers/cookies/HTML/error-page content for {url}"
+                      + (f" (HTTP {observation['status_code']})" if observation.get("status_code") else "")],
             confidence=CONFIDENCE_LOW,
             metadata={
                 "category": category, "url": url,
+                "observation": observation,
                 "note": (
                     "Negative-result-memory: absence of a matching signature does not prove no such "
                     "technology is present — signatures are inherently incomplete, and some "
@@ -1202,7 +1900,10 @@ def run_tech_fingerprint(
     url = validate_url_target(url, target=target)
     target = target or (urllib.parse.urlsplit(url).hostname or url)
     origin = _origin_of(url)
-    store = PendingAssetsStore(output_dir=output_dir)
+    # Every derived request goes through the same scope gate as the entry URL,
+    # so a future change to origin derivation cannot silently reach a host the
+    # caller never authorised.
+    validate_url_target(origin + "/", target=target)
 
     summary: Dict[str, Any] = {
         "url": url,
@@ -1210,22 +1911,51 @@ def run_tech_fingerprint(
         "module": MODULE_NAME,
         "started_at": _now(),
         "fetch_status": None,
+        "status_code": None,
+        "final_url": None,
+        "content_type": None,
+        "body_truncated": False,
+        "baseline_representative": None,
+        "intermediary": None,
+        "conflicts": [],
+        "persistence_available": True,
+        "negative_result_memory": {"persisted": False, "reason": None},
         "technology_summary": {"cms": [], "frameworks": [], "servers": [], "wafs": [], "detections": []},
         "recommended_next_actions": [],
         "favicon": None,
         "errors": [],
     }
 
+    store: Optional[PendingAssetsStore]
+    try:
+        store = PendingAssetsStore(output_dir=output_dir)
+    except PersistenceError as exc:
+        # An unusable output directory is a loud, recorded degradation, not an
+        # unhandled traceback that discards the reconnaissance entirely.
+        store = None
+        summary["persistence_available"] = False
+        summary["errors"].append({"stage": "persistence_init", "error": str(exc)})
+
     baseline = fetch_url(url, timeout=timeout)
     summary["fetch_status"] = baseline["status"]
+    summary["status_code"] = baseline.get("status_code")
+    summary["final_url"] = baseline.get("final_url")
+    summary["body_truncated"] = bool(baseline.get("body_truncated"))
     if baseline["status"] != "found":
         summary["errors"].append({"stage": "fetch", "error": baseline.get("error")})
+        summary["negative_result_memory"]["reason"] = "baseline request did not complete"
         summary["finished_at"] = _now()
         return summary
 
     headers = baseline["headers"]
     body = baseline.get("body")
     cookie_names = parse_cookie_names(baseline.get("set_cookie_headers", []))
+
+    representativeness = assess_response_representativeness(baseline)
+    summary["baseline_representative"] = representativeness
+    summary["content_type"] = representativeness.get("content_type")
+    intermediary = detect_intermediaries(headers)
+    summary["intermediary"] = intermediary
 
     scans: List[Dict[str, Any]] = []
 
@@ -1246,10 +1976,13 @@ def run_tech_fingerprint(
     except Exception as exc:
         summary["errors"].append({"stage": "detect_wafs", "error": str(exc)})
 
+    error_resp: Optional[Dict[str, Any]] = None
+    error_page_ok = not check_error_page
     if check_error_page:
         try:
             error_resp = fetch_error_page_sample(origin, timeout=timeout)
             if error_resp["status"] == "found":
+                error_page_ok = True
                 error_cookie_names = parse_cookie_names(error_resp.get("set_cookie_headers", []))
                 scans.append(detect_technologies_from_content(
                     error_resp["headers"], error_cookie_names, error_resp.get("body"), "error_page_response",
@@ -1290,7 +2023,8 @@ def run_tech_fingerprint(
     if probe_known_paths_enabled and content_scan:
         try:
             corroboration = probe_known_paths(
-                origin, list(content_scan.keys()), timeout=timeout, max_probes=max_known_path_probes,
+                origin, list(content_scan.keys()), timeout=timeout,
+                max_probes=max_known_path_probes, soft_404=error_resp,
             )
             content_scan = _merge_scan_maps(content_scan, corroboration)
         except Exception as exc:
@@ -1299,21 +2033,55 @@ def run_tech_fingerprint(
     all_scan = _merge_scan_maps(content_scan, server_scan, waf_scan)
     detections = _finalize_detections(all_scan, url)
 
+    conflicts = detect_detection_conflicts(detections)
+    summary["conflicts"] = conflicts
+    annotate_detections(detections, intermediary, conflicts, representativeness)
+
     persistence_errors: List[str] = []
     for d in detections:
         err = _safe_store_add(store, make_tech_finding(
             technology=d["technology"], category=d["category"], version=d["version"],
             evidence=d["evidence"], confidence=d["confidence"], target=target, url=d["url"],
+            metadata={
+                "corroborating_urls": d.get("corroborating_urls", []),
+                "conflicts_with": d.get("conflicts_with", []),
+                "observed_through_intermediary": d.get("observed_through_intermediary", False),
+                "cache_status": d.get("cache_status"),
+                "response_status_code": d.get("response_status_code"),
+            },
         ))
         if err:
             persistence_errors.append(err)
     if persistence_errors:
         summary["errors"].append({"stage": "persist_detections", "errors": persistence_errors})
 
-    categories_found = {d["category"] for d in detections}
-    negmem_errors = persist_no_match_findings(categories_found, target, url, store)
-    if negmem_errors:
-        summary["errors"].append({"stage": "negative_result_memory", "errors": negmem_errors})
+    # Negative-result memory is an assertion that a check *completed*, so it is
+    # only recorded when the response it is derived from could actually have
+    # carried the signatures. Otherwise the honest state is "not checked",
+    # which is surface_mapper.py's default for an unrecorded check — recording
+    # "checked and not found" instead would let a redirect stub or a WAF block
+    # page suppress a later, real check.
+    blockers = list(representativeness["reasons"])
+    if not error_page_ok:
+        blockers.append("error-page correlation probe did not complete")
+    if blockers:
+        summary["negative_result_memory"] = {
+            "persisted": False,
+            "reason": "inconclusive observation: " + "; ".join(blockers),
+        }
+    else:
+        observation = {
+            **{k: representativeness[k] for k in ("status_code", "content_type", "body_truncated", "final_url")},
+            "error_page_checked": bool(check_error_page),
+            "favicon_checked": bool(check_favicon),
+            "known_paths_probed": bool(probe_known_paths_enabled),
+            "intermediary_observed": bool(intermediary.get("observed")),
+        }
+        categories_found = {d["category"] for d in detections}
+        negmem_errors = persist_no_match_findings(categories_found, target, url, store, observation=observation)
+        summary["negative_result_memory"] = {"persisted": True, "reason": None}
+        if negmem_errors:
+            summary["errors"].append({"stage": "negative_result_memory", "errors": negmem_errors})
 
     summary["technology_summary"] = build_technology_summary(detections)
     summary["recommended_next_actions"] = build_recommended_actions(detections, target)
