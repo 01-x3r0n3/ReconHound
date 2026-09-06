@@ -111,15 +111,73 @@ established in passive_recon.py:
     exchange, etc.) are NOT persisted, consistent with passive_recon.py's
     treatment of its own "error" states.
 
-Output is intended to feed surface_mapper.py (module 6, not yet
-implemented) — this module does not implement or call into surface_mapper,
-risk_engine, or any other later module.
+Result semantics (context.md §8) — added by the Module 2 forensic audit:
+
+  - FAILURE IS NOT ABSENCE. Port results distinguish "open"/"closed" (the
+    peer answered) from "filtered" (silence), "unreachable" (the host or
+    network could not be reached), "permission_denied" (the local system
+    blocked the probe) and "error". Only "open" and "closed" assert anything
+    about the port itself; everything else means the port's state was not
+    established. connect_ex() reports these as errno return values rather
+    than exceptions, so they are classified from the errno.
+  - PARTIAL IS NOT EMPTY. Scan summaries carry `complete`,
+    `not_conclusive_ports` and `failed_ports`; run_active_recon() carries a
+    `status` ("completed" / "completed_with_errors" / "interrupted") and a
+    per-stage `stages` map recording completed / inconclusive / failed /
+    skipped / not_reached with a reason. A run in which nothing could be
+    tested is therefore never shape-identical to one that tested everything
+    and found nothing.
+  - CORRELATED REPLIES ONLY. The UDP-based checks (SNMP community strings,
+    IPMI presence) validate that a datagram came from the address that was
+    probed, and SNMP additionally requires a well-formed GetResponse whose
+    request-id matches the request just sent. An unconnected UDP socket
+    accepts datagrams from anyone, and probes sharing one socket can
+    otherwise credit a slow reply to the wrong community string.
+  - DISCOVERIES SURVIVE A CTRL-C. Findings are persisted as they are
+    established, not after the whole scan; an interrupt persists what has
+    already been observed (including probes that finished but were not yet
+    collected) and then re-raises, because core/orchestrator.py relies on
+    KeyboardInterrupt propagating. ActiveReconInterrupted subclasses
+    KeyboardInterrupt so that contract still holds while carrying the
+    partial summary.
+  - BOUNDED RESOURCES. Concurrency is capped at MAX_WORKERS_CAP threads
+    regardless of the caller's `max_workers`, and never exceeds the number
+    of ports. Persistence uses one batched read+write per scan rather than
+    one per finding, which was quadratic in the size of the shared
+    pending_assets.json.
+  - ATTACKER-CONTROLLED TEXT IS SANITIZED. Banners and SMTP/FTP reply lines
+    have control characters stripped before they are stored or displayed
+    (the raw bytes are kept as `banner_hex`), because that text reaches the
+    operator's terminal and the HTML report.
+
+Output feeds surface_mapper.py (module 6) — this module does not implement
+or call into surface_mapper, risk_engine, or any other later module.
+
+KNOWN LIMITATIONS retained deliberately (not defects):
+
+  - TCP scanning is connect()-based. SYN/FIN/XMAS/NULL scanning requires
+    raw sockets and root/CAP_NET_RAW, which decision #1 above rules out.
+    ReconHound is an authorized-reconnaissance framework, not an evasion
+    framework, so no stealth/decoy/fragmentation techniques are offered.
+  - UDP "open_filtered" is irreducible without raw ICMP visibility. A
+    connected UDP socket surfaces only ICMP port-unreachable (as
+    ConnectionRefusedError); every other ICMP condition, and any ICMP the
+    network drops, is invisible. Silence is therefore never reported as
+    "open".
+  - Retries are not performed. A single lost UDP datagram is reported as
+    ambiguous rather than retried, which keeps traffic bounded and
+    predictable; retry policy is an orchestration concern.
+  - Service identification reports a port-number prior at LOW confidence
+    and a matched greeting at HIGH confidence, and preserves genuine
+    disagreement between the two as a conflict rather than resolving it.
+    A port number alone is never treated as a confirmed service.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import errno
 import ipaddress
 import json
 import os
@@ -128,6 +186,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -147,6 +206,98 @@ _DB_PORT_SERVICE: Dict[int, str] = {3306: "mysql", 5432: "postgresql"}
 # Well-known/default SNMP community strings (context.md: "SNMP community strings").
 _DEFAULT_SNMP_COMMUNITIES: List[str] = ["public", "private"]
 
+# ---------------------------------------------------------------------------
+# Port-probe result vocabulary (context.md §8: a failure is not a negative
+# result). These statuses deliberately keep "the peer told us the port is
+# shut" separate from "we never learned anything about this port", so that
+# nothing downstream can read a network/permission failure as a confirmed
+# closed port.
+# ---------------------------------------------------------------------------
+
+PORT_OPEN = "open"                       # handshake completed
+PORT_CLOSED = "closed"                   # peer actively refused/reset: a real answer
+PORT_FILTERED = "filtered"               # silence within the timeout
+PORT_UNREACHABLE = "unreachable"         # host/net unreachable: nothing learned about the port
+PORT_PERMISSION_DENIED = "permission_denied"  # local policy blocked the probe
+PORT_ERROR = "error"                     # could not be completed for an unrelated reason
+
+# UDP-only status. UDP silence is fundamentally ambiguous: an open port that
+# simply does not answer this probe is indistinguishable from a filtered one.
+UDP_OPEN_FILTERED = "open_filtered"
+
+# Statuses that represent a genuine observation of the port's state. Anything
+# outside this set means the port's state was not established.
+_CONCLUSIVE_PORT_STATUSES = frozenset({PORT_OPEN, PORT_CLOSED})
+
+# Statuses meaning the probe itself never completed, so nothing at all was
+# learned. This is a narrower set than "not conclusive": silence ("filtered",
+# and UDP's "open_filtered") is an ambiguous *observation* — the probe ran and
+# the target said nothing — whereas an unreachable network or a locally
+# blocked socket means the check did not happen. Collapsing the two would
+# report a firewalled-but-reachable host as a failed scan.
+_PROBE_FAILURE_STATUSES = frozenset({PORT_UNREACHABLE, PORT_PERMISSION_DENIED, PORT_ERROR})
+
+# errno -> status. connect_ex() reports the failure reason as an errno instead
+# of raising, so without this mapping every non-zero return collapses into
+# "closed" — turning an unreachable network or a blocked probe into a
+# confirmed-shut port. Only a refusal or a reset is an answer from the peer.
+_ERRNO_PORT_STATUS: Dict[int, str] = {
+    errno.ECONNREFUSED: PORT_CLOSED,
+    errno.ECONNRESET: PORT_CLOSED,
+    errno.ETIMEDOUT: PORT_FILTERED,
+    errno.EAGAIN: PORT_FILTERED,
+    errno.EWOULDBLOCK: PORT_FILTERED,
+    errno.EINPROGRESS: PORT_FILTERED,
+    errno.EALREADY: PORT_FILTERED,
+    errno.EHOSTUNREACH: PORT_UNREACHABLE,
+    errno.ENETUNREACH: PORT_UNREACHABLE,
+    errno.EHOSTDOWN: PORT_UNREACHABLE,
+    errno.ENETDOWN: PORT_UNREACHABLE,
+    errno.ENETRESET: PORT_UNREACHABLE,
+    errno.EACCES: PORT_PERMISSION_DENIED,
+    errno.EPERM: PORT_PERMISSION_DENIED,
+}
+
+# Upper bound on concurrent probe threads, regardless of what a caller asks
+# for. Each worker holds a socket and an OS thread; an unbounded max_workers
+# lets one call create thousands of both (measured: max_workers=2000 produced
+# ~900 live threads). Reconnaissance is network-bound, so raising concurrency
+# past this buys nothing while risking file-descriptor and thread exhaustion.
+MAX_WORKERS_CAP = 100
+
+# Valid TCP/UDP port range. Port 0 is excluded deliberately: it is not an
+# addressable service port, and connect() to it does not test a real service.
+MIN_PORT = 1
+MAX_PORT = 65535
+
+# run_active_recon outcome vocabulary. A run that failed everywhere must not
+# be shape-identical to a clean run that genuinely found nothing
+# (context.md §8: a failure is not a negative result).
+RUN_COMPLETED = "completed"
+RUN_COMPLETED_WITH_ERRORS = "completed_with_errors"
+RUN_INTERRUPTED = "interrupted"
+
+# Per-stage outcome vocabulary used by run_active_recon()["stages"].
+STAGE_COMPLETED = "completed"
+STAGE_FAILED = "failed"
+STAGE_SKIPPED = "skipped"
+STAGE_NOT_REACHED = "not_reached"
+STAGE_INTERRUPTED_MARK = "interrupted"
+# A stage that ran to completion without establishing anything. Distinct from
+# STAGE_COMPLETED, because the probe helpers deliberately absorb network
+# failures into their result payloads instead of raising: without this, a host
+# that was completely unreachable produced a stage map reading "completed"
+# everywhere and a run status of "completed", which is precisely the
+# "partial scan presented as a complete empty scan" this module must avoid.
+STAGE_INCONCLUSIVE = "inconclusive"
+
+# The fixed stages run_active_recon() always accounts for. Per-port
+# banner/service stages are added dynamically and are not listed here.
+_ALL_STAGE_NAMES: Tuple[str, ...] = (
+    "tcp_scan", "ftp", "ssh", "smtp", "udp_scan", "snmp",
+    "ipmi", "db_exposure", "os_fingerprint",
+)
+
 
 class ScopeError(ValueError):
     """Raised when a scan target falls outside this function's authorized/supported scope."""
@@ -154,6 +305,23 @@ class ScopeError(ValueError):
 
 class PersistenceError(RuntimeError):
     """Raised when output/pending_assets.json cannot be safely read or written."""
+
+
+class ActiveReconInterrupted(KeyboardInterrupt):
+    """
+    A scan stopped by KeyboardInterrupt, carrying the partial summary.
+
+    Subclasses KeyboardInterrupt deliberately: core/orchestrator.py catches
+    KeyboardInterrupt to mark the run interrupted and re-raise it, so this
+    must still satisfy `except KeyboardInterrupt` everywhere it already does.
+    The `summary` attribute is purely additive, for callers that want the
+    partial results. Every discovery made before the interrupt is already on
+    disk in pending_assets.json regardless of whether a caller reads it.
+    """
+
+    def __init__(self, summary: Dict[str, Any]):
+        super().__init__("active recon interrupted")
+        self.summary = summary
 
 
 def _now() -> str:
@@ -222,6 +390,54 @@ def validate_ipv6_scan_target(ip: str) -> str:
         )
 
     return str(ip_obj)
+
+
+def normalize_ports(ports: Any, what: str = "ports") -> List[int]:
+    """
+    Validate and normalize a caller-supplied port list.
+
+    Returns the ports de-duplicated and sorted. Rejects anything that is not a
+    real port number rather than passing it down to the socket layer, where a
+    str/float/None raises an uncaught TypeError out of the probe helpers and a
+    value like 0 or 99999 either silently probes nothing useful or is reported
+    with a status it never actually earned.
+
+    De-duplication matters beyond tidiness: a repeated port would otherwise be
+    scanned once per occurrence and persisted once per occurrence, inflating
+    both the traffic sent to the target and the evidence recorded about it.
+    """
+    if isinstance(ports, (str, bytes)) or not isinstance(ports, (list, tuple, set, frozenset)):
+        raise ValueError(f"`{what}` must be a list of integer port numbers, not {type(ports).__name__}.")
+
+    normalized: List[int] = []
+    for raw in ports:
+        # bool is an int subclass; True would silently become port 1.
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError(f"`{what}` contains a non-integer port: {raw!r}")
+        if not (MIN_PORT <= raw <= MAX_PORT):
+            raise ValueError(
+                f"`{what}` contains {raw!r}, outside the valid port range {MIN_PORT}-{MAX_PORT}."
+            )
+        if raw not in normalized:
+            normalized.append(raw)
+
+    if not normalized:
+        raise ValueError(f"`{what}` must be a non-empty list of port numbers to scan.")
+    return sorted(normalized)
+
+
+def _bounded_workers(max_workers: Any, work_items: int) -> int:
+    """
+    Clamp a caller's requested worker count to something the host can sustain.
+
+    Never more threads than there is work to do, never more than
+    MAX_WORKERS_CAP, never fewer than one.
+    """
+    try:
+        requested = int(max_workers)
+    except (TypeError, ValueError):
+        requested = 1
+    return max(1, min(requested, MAX_WORKERS_CAP, max(1, work_items)))
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +514,32 @@ class PendingAssetsStore:
             self._atomic_write(records)
         return finding
 
+    def add_many(self, findings: List[Dict[str, Any]]) -> int:
+        """
+        Append a batch of findings in ONE read + ONE atomic write.
+
+        add() re-reads and rewrites the entire file per finding, which is
+        correct but quadratic in the number of records already on disk. That
+        cost is invisible for a handful of findings and severe for a port
+        scan: pending_assets.json is shared with every other module, so by the
+        time active_recon runs it already holds the passive phase's records,
+        and each open port then rewrites that whole file again. Measured on
+        this repository: 100 findings 0.11s, 400 findings 1.90s, 800 findings
+        5.48s — roughly 3x the cost for 2x the input.
+
+        Crash-safety is unchanged and arguably stronger: the write is still a
+        single write-to-temp + os.replace, so a crash mid-batch leaves the
+        previous complete file intact and the batch is all-or-nothing rather
+        than half-applied. Returns the number of findings written.
+        """
+        if not findings:
+            return 0
+        with self._lock:
+            records = self._read_all()
+            records.extend(findings)
+            self._atomic_write(records)
+        return len(findings)
+
     def _atomic_write(self, records: List[Dict[str, Any]]) -> None:
         dir_name = os.path.dirname(self.path) or "."
         fd, tmp_path = tempfile.mkstemp(prefix=".pending_assets_", dir=dir_name)
@@ -307,14 +549,54 @@ class PendingAssetsStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, self.path)
+            self._fsync_dir(dir_name)
         except BaseException:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             raise
 
+    @staticmethod
+    def _fsync_dir(dir_name: str) -> None:
+        """
+        Durably commit the os.replace() rename itself.
+
+        Without this the replacement file's *contents* are on disk but the
+        directory entry pointing at them may not be, so a power loss can still
+        resurrect the pre-replace file and lose the discoveries appended since.
+        Best-effort: some platforms/filesystems refuse to fsync a directory.
+        Mirrors passive_recon.py's store, which shares this output file.
+        """
+        try:
+            fd = os.open(dir_name, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
     def all(self) -> List[Dict[str, Any]]:
         with self._lock:
             return self._read_all()
+
+
+def _safe_store_add_many(store: Optional["PendingAssetsStore"],
+                         findings: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    store.add_many() wrapped so one persistence failure cannot discard the
+    in-memory results of a completed scan. Returns None on success, or an
+    error string to be surfaced in the caller's result (context.md §12.11: no
+    silent failures).
+    """
+    if store is None or not findings:
+        return None
+    try:
+        store.add_many(findings)
+        return None
+    except (PersistenceError, OSError) as exc:
+        return str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -328,37 +610,120 @@ def _scan_one_tcp_port(
     Attempt a single TCP connect() to ip:port.
 
     status is one of:
-      "open"     - the TCP handshake completed.
-      "closed"   - the connection was actively refused (or otherwise failed
-                   to establish) — a response was received, just not an
-                   accept.
-      "filtered" - no response was received within `timeout` (consistent
-                   with a firewall silently dropping the packet).
-      "error"    - the attempt could not be completed for a reason unrelated
-                   to the port's open/closed state (e.g. invalid port
-                   number).
+      "open"              - the TCP handshake completed.
+      "closed"            - the peer actively refused or reset the connection.
+                            This is an answer from the target, and the only
+                            non-open status that asserts anything about the
+                            port itself.
+      "filtered"          - no usable response within `timeout` (consistent
+                            with a firewall silently dropping the packet).
+      "unreachable"       - the host or network could not be reached, so
+                            nothing at all was learned about this port.
+      "permission_denied" - the local system refused to send the probe.
+      "error"             - the attempt could not be completed for a reason
+                            unrelated to the port's state.
+
+    connect_ex() reports failures as an errno return value rather than an
+    exception, so the errno is what distinguishes "the peer said no" from
+    "the packet never got there". Treating every non-zero return as "closed"
+    would record an unreachable network as a confirmed-shut port; the
+    `_ERRNO_PORT_STATUS` mapping is what prevents that (context.md §8).
     """
-    entry: Dict[str, Any] = {"port": port, "status": "error", "error": None}
+    entry: Dict[str, Any] = {"port": port, "status": PORT_ERROR, "error": None}
     sock: Optional[socket.socket] = None
     try:
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         addr = (ip, port) if family == socket.AF_INET else (ip, port, 0, 0)
         result = sock.connect_ex(addr)
-        entry["status"] = "open" if result == 0 else "closed"
+        if result == 0:
+            entry["status"] = PORT_OPEN
+        else:
+            entry["status"] = _ERRNO_PORT_STATUS.get(result, PORT_ERROR)
+            entry["error"] = f"{errno.errorcode.get(result, result)}: {os.strerror(result)}"
     except socket.timeout:
-        entry["status"] = "filtered"
+        entry["status"] = PORT_FILTERED
         entry["error"] = "timeout"
     except OverflowError as exc:
-        entry["status"] = "error"
+        entry["status"] = PORT_ERROR
         entry["error"] = f"invalid port number: {exc}"
     except OSError as exc:
-        entry["status"] = "error"
+        # An errno-bearing OSError carries the same distinction as the
+        # connect_ex return value; a bare OSError stays an unclassified error.
+        entry["status"] = _ERRNO_PORT_STATUS.get(exc.errno, PORT_ERROR) if exc.errno else PORT_ERROR
         entry["error"] = str(exc)
+    except (TypeError, ValueError) as exc:
+        # Reachable only when a caller bypasses normalize_ports() and hands a
+        # probe helper a non-integer port directly.
+        entry["status"] = PORT_ERROR
+        entry["error"] = f"invalid port value {port!r}: {exc}"
     finally:
         if sock is not None:
             sock.close()
     return entry
+
+
+def _run_port_probes(
+    probe_one: Any,
+    ports: List[int],
+    max_workers: int,
+    sink: List[Dict[str, Any]],
+    error_entry: Any,
+) -> None:
+    """
+    Run `probe_one(port)` across `ports` with bounded concurrency, appending
+    each result into the caller-owned `sink` list.
+
+    `sink` is caller-owned on purpose. If the scan is interrupted, the caller
+    still holds every result collected before the interrupt and can persist
+    those discoveries before the KeyboardInterrupt continues on its way —
+    which is what stops a Ctrl-C from throwing away confirmed open ports
+    (context.md §12.1: discoveries are written immediately, not at the end).
+
+    KeyboardInterrupt is deliberately re-raised rather than swallowed:
+    core/orchestrator.py records the interrupt and re-raises it to stop the
+    run, so absorbing it here would break that contract. Pending futures are
+    cancelled first so an interrupted scan stops issuing new probes instead of
+    draining the whole queue.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=_bounded_workers(max_workers, len(ports))
+    )
+    interrupted = False
+    drained: set = set()
+    try:
+        future_to_port = {executor.submit(probe_one, port): port for port in ports}
+        try:
+            for future in concurrent.futures.as_completed(future_to_port):
+                port = future_to_port[future]
+                drained.add(future)
+                try:
+                    sink.append(future.result())
+                except Exception as exc:  # probe helpers already carry their own errors
+                    sink.append(error_entry(port, exc))
+        except KeyboardInterrupt:
+            interrupted = True
+            # as_completed() yields in completion order, so at the moment of
+            # the interrupt there are usually probes that already finished but
+            # were never yielded. Harvest those before unwinding: they are
+            # completed observations, and discarding them would throw away
+            # confirmed open ports the scan had genuinely established.
+            for pending, port in future_to_port.items():
+                if pending in drained:
+                    continue
+                if pending.done() and not pending.cancelled():
+                    try:
+                        if pending.exception() is None:
+                            sink.append(pending.result())
+                    except BaseException:
+                        pass  # nothing usable from this probe; keep unwinding
+                else:
+                    pending.cancel()
+            raise
+    finally:
+        # On interrupt, don't block the exit waiting for in-flight probes to
+        # time out; a plain shutdown() would wait for every running worker.
+        executor.shutdown(wait=not interrupted, cancel_futures=True)
 
 
 def tcp_connect_scan(
@@ -382,46 +747,87 @@ def tcp_connect_scan(
     `target` is the logical target this IP belongs to (e.g. the domain
     passed to passive_recon.py), used to tag persisted findings; if
     omitted, `ip` itself is used as the finding's target.
+
+    The returned summary reports coverage explicitly: `complete` says whether
+    every requested port was actually tested, and `not_conclusive_ports`
+    lists ports whose state was never established (filtered/unreachable/
+    permission-denied/error). A port missing from `open_ports` therefore
+    never has to be read as "confirmed closed".
     """
     ip = validate_scan_target(ip)
-
-    if not isinstance(ports, list) or not ports:
-        raise ValueError("`ports` must be a non-empty list of TCP port numbers to scan.")
+    ports = normalize_ports(ports)
 
     results: List[Dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-        future_to_port = {
-            executor.submit(_scan_one_tcp_port, ip, port, timeout): port for port in ports
-        }
-        for future in concurrent.futures.as_completed(future_to_port):
-            port = future_to_port[future]
-            try:
-                results.append(future.result())
-            except Exception as exc:  # _scan_one_tcp_port already contains its own errors
-                results.append({"port": port, "status": "error", "error": str(exc)})
+    try:
+        _run_port_probes(
+            lambda port: _scan_one_tcp_port(ip, port, timeout),
+            ports, max_workers, results,
+            lambda port, exc: {"port": port, "status": PORT_ERROR, "error": str(exc)},
+        )
+    except KeyboardInterrupt:
+        _persist_open_tcp_ports(results, store, ip, target, ip_version=4)
+        raise
+    return _summarize_tcp_scan(results, store, ip, ports, target, ip_version=4)
 
-    results.sort(key=lambda r: r["port"])
-    open_ports = [r["port"] for r in results if r["status"] == "open"]
 
-    if store is not None:
-        for port in open_ports:
-            store.add(make_finding(
-                finding_type="open_tcp_port",
-                target=target or ip,
-                value={"ip": ip, "port": port, "protocol": "tcp"},
-                evidence=[f"TCP connect() handshake to {ip}:{port} succeeded"],
-                confidence=CONFIDENCE_HIGH,
-                metadata={"ip": ip, "port": port, "protocol": "tcp", "ip_version": 4},
-            ))
+def _persist_open_tcp_ports(
+    results: List[Dict[str, Any]],
+    store: Optional[PendingAssetsStore],
+    ip: str,
+    target: Optional[str],
+    ip_version: int,
+) -> Optional[str]:
+    """Persist the open ports among `results` in a single batched write."""
+    if store is None:
+        return None
+    host_repr = ip if ip_version == 4 else f"[{ip}]"
+    findings = [
+        make_finding(
+            finding_type="open_tcp_port",
+            target=target or ip,
+            value={"ip": ip, "port": r["port"], "protocol": "tcp"},
+            evidence=[f"TCP connect() handshake to {host_repr}:{r['port']} succeeded"],
+            confidence=CONFIDENCE_HIGH,
+            metadata={"ip": ip, "port": r["port"], "protocol": "tcp", "ip_version": ip_version},
+        )
+        for r in results if r["status"] == PORT_OPEN
+    ]
+    return _safe_store_add_many(store, findings)
 
-    return {
+
+def _summarize_tcp_scan(
+    results: List[Dict[str, Any]],
+    store: Optional[PendingAssetsStore],
+    ip: str,
+    ports: List[int],
+    target: Optional[str],
+    ip_version: int,
+) -> Dict[str, Any]:
+    results.sort(key=lambda r: (r["port"], r["status"]))
+    open_ports = sorted({r["port"] for r in results if r["status"] == PORT_OPEN})
+    closed_ports = sorted({r["port"] for r in results if r["status"] == PORT_CLOSED})
+    inconclusive = sorted({
+        r["port"] for r in results if r["status"] not in _CONCLUSIVE_PORT_STATUSES
+    })
+    failed = sorted({r["port"] for r in results if r["status"] in _PROBE_FAILURE_STATUSES})
+    persist_error = _persist_open_tcp_ports(results, store, ip, target, ip_version)
+
+    summary: Dict[str, Any] = {
         "ip": ip,
         "protocol": "tcp",
-        "ip_version": 4,
-        "ports_scanned": sorted(ports),
-        "open_ports": sorted(open_ports),
+        "ip_version": ip_version,
+        "ports_scanned": list(ports),
+        "open_ports": open_ports,
+        "closed_ports": closed_ports,
+        "not_conclusive_ports": inconclusive,
+        "failed_ports": failed,
+        "ports_tested": len(results),
+        "complete": len(results) == len(ports),
         "results": results,
     }
+    if persist_error:
+        summary["persistence_error"] = persist_error
+    return summary
 
 
 def ipv6_tcp_connect_scan(
@@ -440,45 +846,19 @@ def ipv6_tcp_connect_scan(
     responsibility, separate from the base TCP scan.
     """
     ip = validate_ipv6_scan_target(ip)
-
-    if not isinstance(ports, list) or not ports:
-        raise ValueError("`ports` must be a non-empty list of TCP port numbers to scan.")
+    ports = normalize_ports(ports)
 
     results: List[Dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-        future_to_port = {
-            executor.submit(_scan_one_tcp_port, ip, port, timeout, socket.AF_INET6): port
-            for port in ports
-        }
-        for future in concurrent.futures.as_completed(future_to_port):
-            port = future_to_port[future]
-            try:
-                results.append(future.result())
-            except Exception as exc:
-                results.append({"port": port, "status": "error", "error": str(exc)})
-
-    results.sort(key=lambda r: r["port"])
-    open_ports = [r["port"] for r in results if r["status"] == "open"]
-
-    if store is not None:
-        for port in open_ports:
-            store.add(make_finding(
-                finding_type="open_tcp_port",
-                target=target or ip,
-                value={"ip": ip, "port": port, "protocol": "tcp"},
-                evidence=[f"TCP connect() handshake to [{ip}]:{port} succeeded"],
-                confidence=CONFIDENCE_HIGH,
-                metadata={"ip": ip, "port": port, "protocol": "tcp", "ip_version": 6},
-            ))
-
-    return {
-        "ip": ip,
-        "protocol": "tcp",
-        "ip_version": 6,
-        "ports_scanned": sorted(ports),
-        "open_ports": sorted(open_ports),
-        "results": results,
-    }
+    try:
+        _run_port_probes(
+            lambda port: _scan_one_tcp_port(ip, port, timeout, socket.AF_INET6),
+            ports, max_workers, results,
+            lambda port, exc: {"port": port, "status": PORT_ERROR, "error": str(exc)},
+        )
+    except KeyboardInterrupt:
+        _persist_open_tcp_ports(results, store, ip, target, ip_version=6)
+        raise
+    return _summarize_tcp_scan(results, store, ip, ports, target, ip_version=6)
 
 
 # ---------------------------------------------------------------------------
@@ -492,33 +872,52 @@ def _scan_one_udp_port(ip: str, port: int, timeout: float, probe: bytes = b"") -
     standard technique, no raw sockets required).
 
     status is one of:
-      "open"          - a response datagram was received.
-      "closed"        - an ICMP port-unreachable was received.
-      "open_filtered" - no response and no ICMP error within `timeout` —
-                        UDP's fundamental ambiguity: silence could mean the
-                        port is open and simply didn't reply to this probe,
-                        or that it's filtered by a firewall.
-      "error"         - the attempt could not be completed for an unrelated
-                        reason.
+      "open"              - a response datagram was received.
+      "closed"            - an ICMP port-unreachable was received.
+      "open_filtered"     - no response and no ICMP error within `timeout` —
+                            UDP's fundamental ambiguity: silence could mean
+                            the port is open and simply didn't reply to this
+                            probe, or that it's filtered by a firewall.
+      "unreachable"       - the host or network could not be reached.
+      "permission_denied" - the local system refused to send the probe.
+      "error"             - the attempt could not be completed for an
+                            unrelated reason.
+
+    LIMITATION: the only ICMP condition a connected UDP socket surfaces is
+    port-unreachable (as ConnectionRefusedError). Other ICMP types, and any
+    ICMP the network filters before it reaches us, are invisible without raw
+    packet capture, which this module's no-raw-socket decision rules out.
+    Absence of an ICMP error is therefore never evidence that a port is open.
     """
-    entry: Dict[str, Any] = {"port": port, "status": "error", "error": None, "response_hex": None}
+    entry: Dict[str, Any] = {"port": port, "status": PORT_ERROR, "error": None, "response_hex": None}
     sock: Optional[socket.socket] = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         sock.connect((ip, port))
-        sock.send(probe)
+        try:
+            sock.send(probe)
+        except ConnectionRefusedError:
+            # A queued ICMP port-unreachable from a previous datagram can be
+            # reported on the next send rather than on recv.
+            entry["status"] = PORT_CLOSED
+            return entry
         try:
             data = sock.recv(2048)
-            entry["status"] = "open"
+            entry["status"] = PORT_OPEN
             entry["response_hex"] = data.hex()
         except socket.timeout:
-            entry["status"] = "open_filtered"
+            entry["status"] = UDP_OPEN_FILTERED
         except ConnectionRefusedError:
-            entry["status"] = "closed"
+            entry["status"] = PORT_CLOSED
     except OSError as exc:
-        entry["status"] = "error"
+        entry["status"] = _ERRNO_PORT_STATUS.get(exc.errno, PORT_ERROR) if exc.errno else PORT_ERROR
+        # ECONNREFUSED maps to "closed", which for UDP is the ICMP
+        # port-unreachable case and stays correct here.
         entry["error"] = str(exc)
+    except (TypeError, ValueError) as exc:
+        entry["status"] = PORT_ERROR
+        entry["error"] = f"invalid port value {port!r}: {exc}"
     finally:
         if sock is not None:
             sock.close()
@@ -549,69 +948,124 @@ def udp_scan(
     scan with real, protocol-correct probes for ports 161 and 623.
     """
     ip = validate_scan_target(ip)
-    ports = ports if ports is not None else list(DEFAULT_UDP_PORTS)
-
-    if not ports:
-        raise ValueError(
-            "`ports` must be a non-empty list of UDP port numbers "
-            "(or omit to use the default 53/161/500/623)."
-        )
+    ports = normalize_ports(
+        ports if ports is not None else list(DEFAULT_UDP_PORTS), what="udp ports"
+    )
 
     results: List[Dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-        future_to_port = {
-            executor.submit(_scan_one_udp_port, ip, port, timeout): port for port in ports
-        }
-        for future in concurrent.futures.as_completed(future_to_port):
-            port = future_to_port[future]
-            try:
-                results.append(future.result())
-            except Exception as exc:
-                results.append(
-                    {"port": port, "status": "error", "error": str(exc), "response_hex": None}
-                )
+    try:
+        _run_port_probes(
+            lambda port: _scan_one_udp_port(ip, port, timeout),
+            ports, max_workers, results,
+            lambda port, exc: {"port": port, "status": PORT_ERROR,
+                               "error": str(exc), "response_hex": None},
+        )
+    except KeyboardInterrupt:
+        _persist_udp_results(results, store, ip, target, timeout)
+        raise
+    return _summarize_udp_scan(results, store, ip, ports, target, timeout)
 
-    results.sort(key=lambda r: r["port"])
-    open_ports = [r["port"] for r in results if r["status"] == "open"]
-    open_filtered_ports = [r["port"] for r in results if r["status"] == "open_filtered"]
 
-    if store is not None:
-        for r in results:
-            if r["status"] == "open":
-                store.add(make_finding(
-                    finding_type="open_udp_port",
-                    target=target or ip,
-                    value={"ip": ip, "port": r["port"], "protocol": "udp", "response_hex": r["response_hex"]},
-                    evidence=[f"UDP probe to {ip}:{r['port']} received a response"],
-                    confidence=CONFIDENCE_HIGH,
-                    metadata={"ip": ip, "port": r["port"], "protocol": "udp"},
-                ))
-            elif r["status"] == "open_filtered":
-                store.add(make_finding(
-                    finding_type="open_or_filtered_udp_port",
-                    target=target or ip,
-                    value={"ip": ip, "port": r["port"], "protocol": "udp"},
-                    evidence=[
-                        f"No response and no ICMP unreachable from {ip}:{r['port']}/udp "
-                        f"within {timeout}s — cannot distinguish open from filtered"
-                    ],
-                    confidence=CONFIDENCE_LOW,
-                    metadata={"ip": ip, "port": r["port"], "protocol": "udp", "ambiguous": True},
-                ))
+def _persist_udp_results(
+    results: List[Dict[str, Any]],
+    store: Optional[PendingAssetsStore],
+    ip: str,
+    target: Optional[str],
+    timeout: float,
+) -> Optional[str]:
+    """Persist responsive and ambiguous UDP results in a single batched write."""
+    if store is None:
+        return None
+    findings: List[Dict[str, Any]] = []
+    for r in results:
+        if r["status"] == PORT_OPEN:
+            findings.append(make_finding(
+                finding_type="open_udp_port",
+                target=target or ip,
+                value={"ip": ip, "port": r["port"], "protocol": "udp",
+                       "response_hex": r["response_hex"]},
+                evidence=[f"UDP probe to {ip}:{r['port']} received a response"],
+                confidence=CONFIDENCE_HIGH,
+                metadata={"ip": ip, "port": r["port"], "protocol": "udp"},
+            ))
+        elif r["status"] == UDP_OPEN_FILTERED:
+            findings.append(make_finding(
+                finding_type="open_or_filtered_udp_port",
+                target=target or ip,
+                value={"ip": ip, "port": r["port"], "protocol": "udp"},
+                evidence=[
+                    f"No response and no ICMP unreachable from {ip}:{r['port']}/udp "
+                    f"within {timeout}s — cannot distinguish open from filtered"
+                ],
+                confidence=CONFIDENCE_LOW,
+                metadata={"ip": ip, "port": r["port"], "protocol": "udp", "ambiguous": True},
+            ))
+    return _safe_store_add_many(store, findings)
 
-    return {
+
+def _summarize_udp_scan(
+    results: List[Dict[str, Any]],
+    store: Optional[PendingAssetsStore],
+    ip: str,
+    ports: List[int],
+    target: Optional[str],
+    timeout: float,
+) -> Dict[str, Any]:
+    results.sort(key=lambda r: (r["port"], r["status"]))
+    open_ports = sorted({r["port"] for r in results if r["status"] == PORT_OPEN})
+    open_filtered_ports = sorted({r["port"] for r in results if r["status"] == UDP_OPEN_FILTERED})
+    closed_ports = sorted({r["port"] for r in results if r["status"] == PORT_CLOSED})
+    inconclusive = sorted({
+        r["port"] for r in results if r["status"] not in _CONCLUSIVE_PORT_STATUSES
+    })
+    failed = sorted({r["port"] for r in results if r["status"] in _PROBE_FAILURE_STATUSES})
+    persist_error = _persist_udp_results(results, store, ip, target, timeout)
+
+    summary: Dict[str, Any] = {
         "ip": ip,
         "protocol": "udp",
-        "ports_scanned": sorted(ports),
-        "open_ports": sorted(open_ports),
-        "open_or_filtered_ports": sorted(open_filtered_ports),
+        "ports_scanned": list(ports),
+        "open_ports": open_ports,
+        "open_or_filtered_ports": open_filtered_ports,
+        "closed_ports": closed_ports,
+        "not_conclusive_ports": inconclusive,
+        "failed_ports": failed,
+        "ports_tested": len(results),
+        "complete": len(results) == len(ports),
         "results": results,
     }
+    if persist_error:
+        summary["persistence_error"] = persist_error
+    return summary
 
 
 # ---------------------------------------------------------------------------
 # Banner grabbing
 # ---------------------------------------------------------------------------
+
+# Control characters are stripped from banner text before it is stored or
+# displayed. A banner is attacker-controlled input that ends up in
+# pending_assets.json, in the Rich terminal output, and in the HTML report;
+# raw ANSI escape sequences there can rewrite or clear the operator's
+# terminal, and NUL/control bytes corrupt downstream text handling. The exact
+# bytes are never lost — grab_banner keeps them verbatim as `banner_hex`.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _sanitize_banner(raw: bytes, max_chars: int = 2048) -> Tuple[str, bool]:
+    """
+    Decode banner bytes to display-safe text.
+
+    Returns (text, was_sanitized). Tab/CR/LF survive as whitespace; every
+    other control character is removed rather than escaped, so nothing
+    downstream can re-interpret it as a terminal control sequence.
+    """
+    decoded = raw.decode("utf-8", errors="replace")
+    cleaned = _CONTROL_CHARS_RE.sub("", decoded).strip()
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars]
+    return cleaned, cleaned != decoded.strip()
+
 
 def grab_banner(
     ip: str,
@@ -630,7 +1084,10 @@ def grab_banner(
     "read the first thing said", not a specific protocol parser (those
     live in the protocol-specific functions below).
     """
-    result: Dict[str, Any] = {"status": "no_data", "banner": None, "error": None}
+    result: Dict[str, Any] = {
+        "status": "no_data", "banner": None, "banner_hex": None,
+        "sanitized": False, "error": None,
+    }
     sock: Optional[socket.socket] = None
     try:
         sock = socket.socket(family, socket.SOCK_STREAM)
@@ -641,26 +1098,46 @@ def grab_banner(
             sock.sendall(probe)
         data = sock.recv(max_bytes)
         if data:
-            result["status"] = "found"
-            result["banner"] = data.decode("utf-8", errors="replace").strip()
+            banner, sanitized = _sanitize_banner(data)
+            result["banner_hex"] = data.hex()
+            result["sanitized"] = sanitized
+            # Bytes that reduce to nothing printable are not a banner. Saying
+            # "found" with banner "" would assert a service identity that the
+            # response does not actually support.
+            if banner:
+                result["status"] = "found"
+                result["banner"] = banner
+            else:
+                result["status"] = "no_data"
+                result["error"] = "response contained no printable characters"
     except socket.timeout:
         result["status"] = "no_data"
         result["error"] = "timeout waiting for banner"
     except OSError as exc:
         result["status"] = "error"
         result["error"] = str(exc)
+    except (TypeError, ValueError) as exc:
+        result["status"] = "error"
+        result["error"] = f"invalid port value {port!r}: {exc}"
     finally:
         if sock is not None:
             sock.close()
 
     if store is not None and result["status"] == "found":
+        evidence = [f"TCP connection to {ip}:{port} returned a banner on connect"]
+        if result["sanitized"]:
+            evidence.append(
+                "banner contained control characters; they were stripped for display "
+                "(raw bytes preserved in metadata.banner_hex)"
+            )
         store.add(make_finding(
             finding_type="banner",
             target=target or ip,
             value={"ip": ip, "port": port, "banner": result["banner"]},
-            evidence=[f"TCP connection to {ip}:{port} returned a banner on connect"],
+            evidence=evidence,
             confidence=CONFIDENCE_HIGH,
-            metadata={"ip": ip, "port": port},
+            metadata={"ip": ip, "port": port, "banner_hex": result["banner_hex"],
+                      "sanitized": result["sanitized"]},
         ))
     return result
 
@@ -678,8 +1155,43 @@ _TCP_SERVICE_SIGNATURES: Dict[int, str] = {
 }
 _UDP_SERVICE_SIGNATURES: Dict[int, str] = {53: "dns", 161: "snmp", 500: "ike", 623: "ipmi-rmcp"}
 
+# Port-heuristic and banner-signature names that describe the SAME protocol at
+# different levels of specificity. A conflict means the two signals disagree
+# about what the service IS — not that one is more specific than the other.
+# Port 587 is the concrete case: its port name is "smtp-submission" while any
+# real server there greets with a generic SMTP banner, so without this the
+# module reported a permanent unresolved conflict for every correctly
+# configured mail submission server (context.md §8: conflicts must be real,
+# because surface_mapper.py preserves them and surfaces them downstream).
+_SERVICE_FAMILY: Dict[str, str] = {
+    "smtp": "smtp",
+    "smtp-submission": "smtp",
+}
+
+
+def _same_service_family(a: Optional[str], b: Optional[str]) -> bool:
+    """True when two service labels describe the same underlying protocol."""
+    if not a or not b:
+        return False
+    return _SERVICE_FAMILY.get(a, a) == _SERVICE_FAMILY.get(b, b)
+
+
+# A response that is plainly HTTP or HTML is a web page, not a database
+# greeting. Without this guard, an HTTP 500 page containing the words "MySQL
+# connection failed" was identified as a MySQL service at HIGH confidence and
+# written into the graph as the port's service.
+_LOOKS_HTTP_RE = re.compile(r"^(HTTP/\d|<!doctype|<html)", re.I)
+
 
 def _banner_based_service_guess(banner: Optional[str]) -> Optional[str]:
+    """
+    Map a service's own greeting onto a protocol name.
+
+    Every rule here keys off the *greeting form* a server actually emits, not
+    on a keyword appearing anywhere in the response: a keyword match is
+    satisfied just as easily by an error message that names the technology as
+    by the service itself.
+    """
     if not banner:
         return None
     b = banner.strip()
@@ -690,7 +1202,12 @@ def _banner_based_service_guess(banner: Optional[str]) -> Optional[str]:
         return "ftp"
     if bl.startswith("220") and ("smtp" in bl or "esmtp" in bl):
         return "smtp"
-    if "mysql" in bl or "mariadb" in bl:
+    if _LOOKS_HTTP_RE.match(b):
+        return None
+    # A MySQL/MariaDB server greeting leads with the version string, so the
+    # product name appears at the very start. Requiring that position keeps a
+    # web page that merely mentions the database from being identified as one.
+    if re.match(r"^[\x00-\x20]*[\d.]*[\w.\-]*(mysql|mariadb)", bl):
         return "mysql"
     return None
 
@@ -716,13 +1233,27 @@ def identify_service(
     port_guess = port_map.get(port)
     banner_guess = _banner_based_service_guess(banner)
 
-    conflict = bool(port_guess and banner_guess and port_guess != banner_guess)
+    conflict = bool(
+        port_guess and banner_guess
+        and port_guess != banner_guess
+        and not _same_service_family(port_guess, banner_guess)
+    )
     if conflict:
         service = None
         confidence = CONFIDENCE_LOW
         evidence = [
             f"port {port}/{protocol} is commonly associated with {port_guess!r}, "
             f"but the banner matches the {banner_guess!r} signature instead"
+        ]
+    elif banner_guess and _same_service_family(port_guess, banner_guess):
+        # Two independent signals agreeing on the protocol (context.md §8:
+        # converging signals raise confidence). Keep the port's more specific
+        # label — 587 is SMTP submission, not plain SMTP.
+        service = port_guess
+        confidence = CONFIDENCE_HIGH
+        evidence = [
+            f"port {port}/{protocol} is commonly associated with {port_guess!r} and the "
+            f"banner matched the compatible {banner_guess!r} signature"
         ]
     elif banner_guess:
         service = banner_guess
@@ -774,7 +1305,14 @@ def _recv_line(sock: socket.socket, max_bytes: int = 512) -> Optional[str]:
     data = sock.recv(max_bytes)
     if not data:
         return None
-    return data.decode("utf-8", errors="replace").strip()
+    # SMTP/FTP greetings and reply text are attacker-controlled and are stored
+    # in findings and rendered to the operator's terminal, exactly like the
+    # banners grab_banner() handles. Strip control characters here too, so the
+    # protection does not depend on which code path read the bytes. The
+    # leading 3-digit reply code that _parse_response_code() needs is
+    # unaffected.
+    text, _ = _sanitize_banner(data, max_chars=max_bytes)
+    return text
 
 
 def _send_line(sock: socket.socket, text: str) -> None:
@@ -849,7 +1387,21 @@ def smtp_probe(
         store.add(make_finding(
             finding_type="smtp_enumeration",
             target=target or ip,
-            value={"ip": ip, "port": port, "vrfy": result["vrfy"], "expn": result["expn"]},
+            # `vrfy_supported`/`expn_supported` are flattened alongside the
+            # nested structures, not instead of them. risk_engine.py's
+            # smtp_user_enumeration rule reads the finding value directly and
+            # matches on these flat keys; with only the nested form, a
+            # confirmed VRFY/EXPN exposure reached the risk engine as an
+            # "unclassified" signal and was never scored (verified end-to-end
+            # against risk_engine.extract_signals). The nested keys are kept
+            # so any existing consumer of value["vrfy"]["supported"] is
+            # unaffected.
+            value={
+                "ip": ip, "port": port,
+                "vrfy": result["vrfy"], "expn": result["expn"],
+                "vrfy_supported": bool(result["vrfy"]["supported"]),
+                "expn_supported": bool(result["expn"]["supported"]),
+            },
             evidence=[
                 f"SMTP VRFY response: {result['vrfy']['response']!r}",
                 f"SMTP EXPN response: {result['expn']['response']!r}",
@@ -898,16 +1450,31 @@ def _ber_int(n: int) -> bytes:
 
 
 def _ber_read_tlv(data: bytes, offset: int) -> Tuple[int, bytes, int]:
+    """
+    Read one BER TLV, rejecting truncated input explicitly.
+
+    Bounds are checked rather than left to slicing, because Python silently
+    returns a short slice for an over-long length. Unchecked, a truncated or
+    hostile datagram would yield a plausible-looking parse instead of an
+    error, and this parser's output decides whether an SNMP community string
+    is reported as accepted.
+    """
+    if offset + 2 > len(data):
+        raise ValueError("truncated BER TLV header")
     tag = data[offset]
     offset += 1
     first = data[offset]
     offset += 1
     if first & 0x80:
         n = first & 0x7F
+        if n == 0 or offset + n > len(data):
+            raise ValueError("truncated or indefinite BER length")
         length = int.from_bytes(data[offset:offset + n], "big")
         offset += n
     else:
         length = first
+    if offset + length > len(data):
+        raise ValueError("BER TLV length exceeds available data")
     value = data[offset:offset + length]
     offset += length
     return tag, value, offset
@@ -921,27 +1488,46 @@ def _snmp_build_get_request(community: str, request_id: int) -> bytes:
     return _ber_tlv(0x30, _ber_int(0) + _ber_tlv(0x04, community.encode("utf-8")) + pdu)
 
 
-def _snmp_parse_get_response(data: bytes) -> Dict[str, Any]:
-    parsed: Dict[str, Any] = {"error_status": None, "sysdescr": None}
-    _, body, _ = _ber_read_tlv(data, 0)
-    pos = 0
-    _, _, pos = _ber_read_tlv(body, pos)  # version
-    _, _, pos = _ber_read_tlv(body, pos)  # community
-    pdu_tag, pdu_val, _ = _ber_read_tlv(body, pos)
-    if pdu_tag != 0xA2:  # GetResponse-PDU
-        return parsed
-    p = 0
-    _, _, p = _ber_read_tlv(pdu_val, p)  # request-id
-    _, err_val, p = _ber_read_tlv(pdu_val, p)  # error-status
-    _, _, p = _ber_read_tlv(pdu_val, p)  # error-index
-    _, vbl_val, _ = _ber_read_tlv(pdu_val, p)  # variable-bindings
-    parsed["error_status"] = int.from_bytes(err_val, "big") if err_val else 0
+def _snmp_parse_get_response(data: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Parse an SNMP GetResponse, returning None when `data` is not one.
+
+    Returning None (rather than a default-filled dict) is what lets the caller
+    distinguish "a valid SNMP agent answered" from "some datagram arrived".
+    The parsed request-id is returned so the caller can correlate the reply
+    with the request that produced it.
+    """
+    try:
+        _, body, _ = _ber_read_tlv(data, 0)
+        pos = 0
+        _, _, pos = _ber_read_tlv(body, pos)  # version
+        _, community_val, pos = _ber_read_tlv(body, pos)  # community
+        pdu_tag, pdu_val, _ = _ber_read_tlv(body, pos)
+        if pdu_tag != 0xA2:  # not a GetResponse-PDU
+            return None
+        p = 0
+        _, req_val, p = _ber_read_tlv(pdu_val, p)  # request-id
+        _, err_val, p = _ber_read_tlv(pdu_val, p)  # error-status
+        _, _, p = _ber_read_tlv(pdu_val, p)  # error-index
+        _, vbl_val, _ = _ber_read_tlv(pdu_val, p)  # variable-bindings
+    except (ValueError, IndexError):
+        return None
+
+    parsed: Dict[str, Any] = {
+        "request_id": int.from_bytes(req_val, "big") if req_val else None,
+        "error_status": int.from_bytes(err_val, "big") if err_val else 0,
+        "community_echo": community_val.decode("utf-8", errors="replace") if community_val else "",
+        "sysdescr": None,
+    }
     if vbl_val:
-        _, vb_val, _ = _ber_read_tlv(vbl_val, 0)
-        _, _, p2 = _ber_read_tlv(vb_val, 0)  # oid
-        val_tag, val_val, _ = _ber_read_tlv(vb_val, p2)
-        if val_tag == 0x04:
-            parsed["sysdescr"] = val_val.decode("utf-8", errors="replace")
+        try:
+            _, vb_val, _ = _ber_read_tlv(vbl_val, 0)
+            _, _, p2 = _ber_read_tlv(vb_val, 0)  # oid
+            val_tag, val_val, _ = _ber_read_tlv(vb_val, p2)
+            if val_tag == 0x04:
+                parsed["sysdescr"] = val_val.decode("utf-8", errors="replace")
+        except (ValueError, IndexError):
+            pass  # a valid PDU whose varbind we could not read is still a real reply
     return parsed
 
 
@@ -956,36 +1542,82 @@ def snmp_community_probe(
     """
     Test well-known/default SNMP community strings ("public", "private" by
     default) with a real SNMPv1 GetRequest for sysDescr.0. A community
-    string is treated as accepted if the agent replies at all — SNMP
-    agents conventionally do not respond to a GetRequest carrying an
-    unrecognized community string, so any reply demonstrates the community
-    was accepted (this mirrors how established SNMP scanners like
-    onesixtyone work).
+    string is treated as accepted if the agent returns a valid GetResponse
+    correlated to that specific request — SNMP agents conventionally do not
+    respond to a GetRequest carrying an unrecognized community string, so a
+    correlated reply demonstrates the community was accepted (this mirrors
+    how established SNMP scanners like onesixtyone work).
+
+    Three correlation rules keep that inference honest, because the probes
+    share one socket and UDP gives no delivery ordering:
+
+      1. The reply must come from the address that was probed. An unconnected
+         UDP socket will happily accept a datagram from anyone.
+      2. The reply's request-id must match the request just sent. Without
+         this, a slow answer to "public" is read by the next recv and
+         credited to "private" — reporting a community the agent never
+         accepted, and missing the one it did.
+      3. The datagram must parse as a real GetResponse PDU. Without this, any
+         unrelated UDP noise on port 161 is reported as a default community
+         string being accepted.
+
+    Datagrams that arrive but fail these rules are recorded under
+    `unverified_responses` as evidence rather than discarded, and never count
+    as acceptance.
     """
     communities = communities or list(_DEFAULT_SNMP_COMMUNITIES)
     result: Dict[str, Any] = {
-        "status": "checked", "accepted": [], "communities_tried": list(communities), "error": None,
+        "status": "checked", "accepted": [], "communities_tried": list(communities),
+        "unverified_responses": [], "error": None,
     }
     sock: Optional[socket.socket] = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         for idx, community in enumerate(communities):
-            packet = _snmp_build_get_request(community, request_id=idx + 1)
-            try:
-                sock.sendto(packet, (ip, port))
-                data, _ = sock.recvfrom(2048)
-            except socket.timeout:
-                continue
-            try:
+            request_id = idx + 1
+            packet = _snmp_build_get_request(community, request_id=request_id)
+            sock.sendto(packet, (ip, port))
+
+            # Read until this request is answered or its own time budget runs
+            # out, rather than accepting the first datagram that shows up.
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    sock.settimeout(remaining)
+                    data, addr = sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                except ConnectionRefusedError:
+                    break  # ICMP port-unreachable: nothing is listening
+
+                if addr[0] != ip:
+                    result["unverified_responses"].append(
+                        {"community": community, "reason": "source address mismatch",
+                         "from": addr[0]})
+                    continue
                 parsed = _snmp_parse_get_response(data)
-            except Exception:
-                parsed = {"error_status": None, "sysdescr": None}
-            result["accepted"].append({
-                "community": community,
-                "error_status": parsed.get("error_status"),
-                "sysdescr": parsed.get("sysdescr"),
-            })
+                if parsed is None:
+                    result["unverified_responses"].append(
+                        {"community": community, "reason": "not a valid SNMP GetResponse",
+                         "response_hex": data[:64].hex()})
+                    continue
+                if parsed.get("request_id") != request_id:
+                    # A late reply to an earlier community; do not credit it here.
+                    result["unverified_responses"].append(
+                        {"community": community, "reason": "request-id mismatch",
+                         "expected": request_id, "received": parsed.get("request_id")})
+                    continue
+
+                result["accepted"].append({
+                    "community": community,
+                    "error_status": parsed.get("error_status"),
+                    "sysdescr": parsed.get("sysdescr"),
+                })
+                break
     except OSError as exc:
         result["status"] = "error"
         result["error"] = str(exc)
@@ -1172,19 +1804,41 @@ def check_ipmi_exposure(
     annotation, distinct from risk_engine.py's later relationship-based
     scoring, which this module does not implement).
     """
-    result: Dict[str, Any] = {"status": "checked", "exposed": False, "raw_response_hex": None, "error": None}
+    result: Dict[str, Any] = {
+        "status": "checked", "exposed": False, "raw_response_hex": None,
+        "unverified_responses": [], "error": None,
+    }
     sock: Optional[socket.socket] = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         sock.sendto(_RMCP_PRESENCE_PING, (ip, port))
-        try:
-            data, _ = sock.recvfrom(256)
+        # The socket is unconnected, so it will accept a datagram from ANY
+        # source. Without checking the sender, an unrelated host's reply would
+        # be recorded as IPMI exposure on this target — and context.md marks
+        # IPMI exposure auto-CRITICAL, so that false positive is expensive.
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                sock.settimeout(remaining)
+                data, addr = sock.recvfrom(256)
+            except socket.timeout:
+                break
+            except ConnectionRefusedError:
+                break  # ICMP port-unreachable: nothing is listening
+            if addr[0] != ip:
+                result["unverified_responses"].append(
+                    {"reason": "source address mismatch", "from": addr[0]})
+                continue
             if len(data) >= 4 and data[0] == 0x06 and data[3] == 0x06:
                 result["exposed"] = True
                 result["raw_response_hex"] = data.hex()
-        except socket.timeout:
-            result["exposed"] = False
+                break
+            result["unverified_responses"].append(
+                {"reason": "not an RMCP presence pong", "response_hex": data[:32].hex()})
     except OSError as exc:
         result["status"] = "error"
         result["error"] = str(exc)
@@ -1232,26 +1886,38 @@ def check_database_exposure(
     check_ipmi_exposure's docstring for why this isn't risk_engine.py
     scoring).
     """
-    ports = ports or sorted(_DB_PORT_SERVICE)
-    result: Dict[str, Any] = {"status": "checked", "exposed_ports": [], "details": {}, "error": None}
+    ip = validate_scan_target(ip)
+    ports = normalize_ports(ports if ports else sorted(_DB_PORT_SERVICE), what="db ports")
+    result: Dict[str, Any] = {
+        "status": "checked", "exposed_ports": [], "inconclusive_ports": [],
+        "details": {}, "error": None,
+    }
 
     for port in ports:
         entry: Dict[str, Any] = {
             "port": port, "service": _DB_PORT_SERVICE.get(port, "unknown"),
-            "open": False, "banner": None,
+            "open": False, "banner": None, "status": None,
         }
         scan_entry = _scan_one_tcp_port(ip, port, timeout)
-        if scan_entry["status"] == "open":
+        entry["status"] = scan_entry["status"]
+        if scan_entry["status"] == PORT_OPEN:
             entry["open"] = True
             banner_result = grab_banner(ip, port, timeout=timeout)
             if banner_result["status"] == "found":
                 entry["banner"] = banner_result["banner"]
             result["exposed_ports"].append(port)
+        elif scan_entry["status"] not in _CONCLUSIVE_PORT_STATUSES:
+            # Never learned whether this port is reachable. Recording it as
+            # "not exposed" would turn a failed probe into a clean bill of
+            # health for a port context.md treats as auto-CRITICAL.
+            result["inconclusive_ports"].append(port)
         result["details"][str(port)] = entry
 
     if store is not None and result["status"] == "checked":
         exposed = bool(result["exposed_ports"])
-        metadata = {"ip": ip, "ports_checked": ports}
+        metadata: Dict[str, Any] = {"ip": ip, "ports_checked": ports}
+        if result["inconclusive_ports"]:
+            metadata["inconclusive_ports"] = list(result["inconclusive_ports"])
         if exposed:
             evidence = [
                 f"TCP port {p} ({_DB_PORT_SERVICE.get(p, 'unknown')}) reachable on {ip}"
@@ -1260,12 +1926,26 @@ def check_database_exposure(
             confidence = CONFIDENCE_HIGH
             metadata["severity"] = "CRITICAL"
         else:
-            evidence = [f"No database ports ({', '.join(str(p) for p in ports)}) reachable on {ip}"]
+            tested = [p for p in ports if p not in result["inconclusive_ports"]]
+            evidence = []
+            if tested:
+                evidence.append(
+                    f"No database ports ({', '.join(str(p) for p in tested)}) reachable on {ip}"
+                )
+            if result["inconclusive_ports"]:
+                evidence.append(
+                    f"Port(s) {', '.join(str(p) for p in result['inconclusive_ports'])} could not "
+                    f"be conclusively tested on {ip} "
+                    f"({', '.join(sorted({result['details'][str(p)]['status'] for p in result['inconclusive_ports']}))})"
+                    " — this is not evidence that they are closed"
+                )
             confidence = CONFIDENCE_LOW
         store.add(make_finding(
             finding_type="db_exposure",
             target=target or ip,
-            value={"ip": ip, "exposed_ports": result["exposed_ports"], "details": result["details"]},
+            value={"ip": ip, "exposed_ports": result["exposed_ports"],
+                   "inconclusive_ports": result["inconclusive_ports"],
+                   "details": result["details"]},
             evidence=evidence,
             confidence=confidence,
             metadata=metadata,
@@ -1290,6 +1970,25 @@ def _guess_os_from_ttl(ttl: int) -> Optional[str]:
         if ttl <= baseline:
             return label
     return None
+
+
+def _ttl_observation(ttl: int) -> Dict[str, Any]:
+    """
+    Describe what an observed TTL actually supports.
+
+    A received TTL is the initial TTL minus the hop count, so it identifies an
+    initial-TTL baseline, not an operating system, and only if no intermediary
+    rewrote it. The hop estimate is reported alongside the family so the
+    inference stays auditable, and `may_be_intermediary` records that the
+    responder may be a NAT, load balancer, proxy or firewall answering on the
+    host's behalf rather than the host itself.
+    """
+    baseline = next((b for b, _ in _TTL_BASELINES if ttl <= b), None)
+    return {
+        "initial_ttl_baseline": baseline,
+        "estimated_hops": (baseline - ttl) if baseline is not None else None,
+        "may_be_intermediary": True,
+    }
 
 
 def fingerprint_os_ttl(
@@ -1362,14 +2061,25 @@ def fingerprint_os_ttl(
             sock.close()
 
     if store is not None and result["status"] == "found":
+        observation = _ttl_observation(result["ttl"])
+        result["observation"] = observation
         store.add(make_finding(
             finding_type="os_fingerprint",
             target=target or ip,
             value={"ip": ip, "ttl": result["ttl"], "os_guess": result["os_guess"]},
-            evidence=[f"Inbound IP TTL from {ip}:{port}/udp observed as {result['ttl']}"],
+            evidence=[
+                f"Inbound IP TTL from {ip}:{port}/udp observed as {result['ttl']}",
+                f"consistent with an initial TTL of {observation['initial_ttl_baseline']} "
+                f"about {observation['estimated_hops']} hop(s) away",
+                "the responding device may be a NAT/proxy/load balancer rather than the "
+                "target host itself, and a single TTL cannot distinguish the two",
+            ],
             confidence=CONFIDENCE_LOW,
             metadata={
                 "ip": ip, "port": port, "method": "ttl_only_udp",
+                "initial_ttl_baseline": observation["initial_ttl_baseline"],
+                "estimated_hops": observation["estimated_hops"],
+                "may_be_intermediary": True,
                 "note": "TCP-window-based fingerprinting not implemented (requires raw packet capture).",
             },
         ))
@@ -1417,11 +2127,24 @@ def detect_cross_host_port_pattern(
     common_ports = common_ports if common_ports is not None else _DEFAULT_COMMON_PORTS
     port_to_ips: Dict[int, List[str]] = {}
 
+    if not isinstance(host_scan_results, (list, tuple)):
+        host_scan_results = []
+
+    # Correlation runs over results accumulated from many scans, any one of
+    # which may be malformed. A bad entry is skipped rather than allowed to
+    # abort correlation of every other host (context.md §12.11).
     for entry in host_scan_results:
-        ip = entry.get("ip")
-        if not ip:
+        if not isinstance(entry, dict):
             continue
-        for port in entry.get("open_ports", []):
+        ip = entry.get("ip")
+        if not ip or not isinstance(ip, str):
+            continue
+        ports = entry.get("open_ports")
+        if not isinstance(ports, (list, tuple, set, frozenset)):
+            continue
+        for port in ports:
+            if isinstance(port, bool) or not isinstance(port, int):
+                continue
             if port in common_ports:
                 continue
             ips = port_to_ips.setdefault(port, [])
@@ -1480,6 +2203,18 @@ def run_active_recon(
     and cross-host pattern detection are out of scope for this
     orchestrator — call ipv6_tcp_connect_scan / detect_cross_host_port_pattern
     directly for those.
+
+    COMPLETENESS: the summary carries `status` ("completed",
+    "completed_with_errors" or "interrupted") and a per-stage `stages` map.
+    Without them, a run in which every stage failed is indistinguishable from
+    a run that completed cleanly and found nothing — the caller sees the same
+    empty `tcp`/`udp`/`banners` structures either way. Callers that need to
+    know whether "nothing found" means "nothing is there" must read `status`
+    and `stages`, not just the result payloads.
+
+    A KeyboardInterrupt is re-raised after the partial summary has been
+    recorded and every discovery so far persisted, because
+    core/orchestrator.py relies on the interrupt propagating to stop the run.
     """
     ip = validate_scan_target(ip)
     store = PendingAssetsStore(output_dir=output_dir)
@@ -1489,6 +2224,8 @@ def run_active_recon(
         "target": target or ip,
         "module": MODULE_NAME,
         "started_at": _now(),
+        "status": RUN_COMPLETED,
+        "stages": {},
         "tcp": {},
         "udp": {},
         "banners": {},
@@ -1504,91 +2241,190 @@ def run_active_recon(
     }
 
     open_tcp_ports: List[int] = []
-    if tcp_ports:
-        try:
-            summary["tcp"] = tcp_connect_scan(
-                ip, tcp_ports, store=store, target=target, timeout=timeout, max_workers=max_workers,
-            )
-            open_tcp_ports = summary["tcp"].get("open_ports", [])
-        except Exception as exc:
-            summary["errors"].append({"stage": "tcp_scan", "error": str(exc)})
 
-    for port in open_tcp_ports:
-        try:
-            banner_result = grab_banner(ip, port, store=store, target=target, timeout=timeout)
-            summary["banners"][str(port)] = banner_result
-            summary["services"][str(port)] = identify_service(
-                ip, port, banner=banner_result.get("banner"), protocol="tcp",
-                store=store, target=target,
-            )
-        except Exception as exc:
-            summary["errors"].append({"stage": "banner_service", "port": port, "error": str(exc)})
+    def _stage_outcome(value: Any) -> Tuple[str, Optional[str]]:
+        """
+        Decide whether a stage that returned normally actually learned anything.
 
-    if 21 in open_tcp_ports:
-        try:
-            summary["ftp"] = ftp_anonymous_login_check(ip, store=store, target=target, timeout=timeout)
-        except Exception as exc:
-            summary["errors"].append({"stage": "ftp", "error": str(exc)})
-
-    if 22 in open_tcp_ports:
-        try:
-            summary["ssh"] = ssh_fingerprint(ip, store=store, target=target, timeout=timeout)
-        except Exception as exc:
-            summary["errors"].append({"stage": "ssh", "error": str(exc)})
-
-    smtp_ports = [p for p in (25, 587) if p in open_tcp_ports]
-    if smtp_ports:
-        try:
-            summary["smtp"] = smtp_probe(
-                ip, port=smtp_ports[0], store=store, target=target, timeout=timeout,
-                probe_user=smtp_probe_user,
-            )
-        except Exception as exc:
-            summary["errors"].append({"stage": "smtp", "error": str(exc)})
-
-    udp_ports = udp_ports if udp_ports is not None else list(DEFAULT_UDP_PORTS)
-    try:
-        summary["udp"] = udp_scan(ip, udp_ports, store=store, target=target, timeout=timeout, max_workers=max_workers)
-    except Exception as exc:
-        summary["errors"].append({"stage": "udp_scan", "error": str(exc)})
-
-    if 161 in udp_ports:
-        try:
-            summary["snmp"] = snmp_community_probe(
-                ip, store=store, target=target, timeout=timeout, communities=snmp_communities,
-            )
-        except Exception as exc:
-            summary["errors"].append({"stage": "snmp", "error": str(exc)})
-
-    if check_ipmi_enabled:
-        try:
-            summary["ipmi"] = check_ipmi_exposure(ip, store=store, target=target, timeout=timeout)
-        except Exception as exc:
-            summary["errors"].append({"stage": "ipmi", "error": str(exc)})
-
-    if check_db_exposure_enabled:
-        try:
-            summary["db_exposure"] = check_database_exposure(ip, store=store, target=target, timeout=timeout)
-        except Exception as exc:
-            summary["errors"].append({"stage": "db_exposure", "error": str(exc)})
-
-    if fingerprint_os_enabled:
-        os_port = None
-        os_probe = b""
-        if summary["snmp"] and summary["snmp"].get("accepted"):
-            os_port = 161
-            os_probe = _snmp_build_get_request(summary["snmp"]["accepted"][0]["community"], request_id=999)
-        elif summary["ipmi"] and summary["ipmi"].get("exposed"):
-            os_port = 623
-            os_probe = _RMCP_PRESENCE_PING
-        if os_port:
-            try:
-                summary["os_fingerprint"] = fingerprint_os_ttl(
-                    ip, os_port, probe=os_probe, store=store, target=target, timeout=timeout,
+        Returns (status, reason). The probe helpers report network failures in
+        their return value rather than by raising, so "did not raise" is not
+        evidence that a check succeeded.
+        """
+        if not isinstance(value, dict):
+            return STAGE_COMPLETED, None
+        if value.get("status") == "error":
+            return STAGE_INCONCLUSIVE, str(value.get("error") or "check reported an error status")
+        scanned = value.get("ports_scanned")
+        if scanned is not None:
+            if not value.get("complete", True):
+                return STAGE_INCONCLUSIVE, "not every requested port was tested"
+            # Only probe *failures* make a scan stage inconclusive. A port that
+            # answered "closed", or stayed silent ("filtered"/"open_filtered"),
+            # was successfully probed — silence is an ambiguous observation,
+            # not a failed check.
+            failed = value.get("failed_ports") or []
+            if scanned and len(failed) == len(scanned):
+                return STAGE_INCONCLUSIVE, (
+                    f"every one of the {len(scanned)} port(s) probed failed before a "
+                    f"result could be observed"
                 )
-            except Exception as exc:
-                summary["errors"].append({"stage": "os_fingerprint", "error": str(exc)})
+        # check_database_exposure reports per-port status under "details"
+        # rather than as a port scan summary.
+        details = value.get("details")
+        if isinstance(details, dict) and details:
+            statuses = [d.get("status") for d in details.values() if isinstance(d, dict)]
+            if statuses and all(s in _PROBE_FAILURE_STATUSES for s in statuses):
+                return STAGE_INCONCLUSIVE, (
+                    "every database port probe failed before a result could be observed"
+                )
+        return STAGE_COMPLETED, None
 
+    def _stage(name: str, fn: Any, *, skipped_reason: Optional[str] = None) -> Any:
+        """
+        Run one recon stage, recording its outcome.
+
+        Every stage records completed / failed / skipped, so the caller can
+        tell an empty result that means "checked, nothing there" from one that
+        means "this check never ran". A stage failure is contained (context.md
+        §12.11: one failure must not abort unrelated work); KeyboardInterrupt
+        is not contained, because the run is being stopped.
+        """
+        if skipped_reason is not None:
+            summary["stages"][name] = {"status": STAGE_SKIPPED, "reason": skipped_reason}
+            return None
+        try:
+            value = fn()
+            status, reason = _stage_outcome(value)
+            record: Dict[str, Any] = {"status": status}
+            if reason:
+                record["reason"] = reason
+            # A scan can succeed while its findings fail to persist. That is a
+            # real failure of this module's crash-safety guarantee, so it must
+            # degrade the run rather than be buried in the payload.
+            if isinstance(value, dict) and value.get("persistence_error"):
+                record["persistence_error"] = value["persistence_error"]
+                summary["errors"].append(
+                    {"stage": name, "error": f"persistence failed: {value['persistence_error']}"}
+                )
+            summary["stages"][name] = record
+            return value
+        except KeyboardInterrupt:
+            summary["stages"][name] = {"status": STAGE_INTERRUPTED_MARK}
+            raise
+        except Exception as exc:
+            summary["errors"].append({"stage": name, "error": str(exc)})
+            summary["stages"][name] = {"status": STAGE_FAILED, "error": str(exc)}
+            return None
+
+    try:
+        if tcp_ports:
+            tcp_result = _stage("tcp_scan", lambda: tcp_connect_scan(
+                ip, tcp_ports, store=store, target=target,
+                timeout=timeout, max_workers=max_workers,
+            ))
+            if tcp_result is not None:
+                summary["tcp"] = tcp_result
+                open_tcp_ports = tcp_result.get("open_ports", [])
+        else:
+            _stage("tcp_scan", None, skipped_reason=(
+                "no tcp_ports supplied; active_recon ships no default TCP port list "
+                "(see module docstring decision 2)"
+            ))
+
+        for port in open_tcp_ports:
+            def _banner_and_service(port: int = port) -> None:
+                banner_result = grab_banner(ip, port, store=store, target=target, timeout=timeout)
+                summary["banners"][str(port)] = banner_result
+                summary["services"][str(port)] = identify_service(
+                    ip, port, banner=banner_result.get("banner"), protocol="tcp",
+                    store=store, target=target,
+                )
+            _stage(f"banner_service:{port}", _banner_and_service)
+
+        if 21 in open_tcp_ports:
+            summary["ftp"] = _stage("ftp", lambda: ftp_anonymous_login_check(
+                ip, store=store, target=target, timeout=timeout))
+        else:
+            _stage("ftp", None, skipped_reason="port 21/tcp was not observed open")
+
+        if 22 in open_tcp_ports:
+            summary["ssh"] = _stage("ssh", lambda: ssh_fingerprint(
+                ip, store=store, target=target, timeout=timeout))
+        else:
+            _stage("ssh", None, skipped_reason="port 22/tcp was not observed open")
+
+        smtp_ports = [p for p in (25, 587) if p in open_tcp_ports]
+        if smtp_ports:
+            summary["smtp"] = _stage("smtp", lambda: smtp_probe(
+                ip, port=smtp_ports[0], store=store, target=target, timeout=timeout,
+                probe_user=smtp_probe_user))
+        else:
+            _stage("smtp", None, skipped_reason="neither port 25/tcp nor 587/tcp was observed open")
+
+        effective_udp_ports = udp_ports if udp_ports is not None else list(DEFAULT_UDP_PORTS)
+        udp_result = _stage("udp_scan", lambda: udp_scan(
+            ip, effective_udp_ports, store=store, target=target,
+            timeout=timeout, max_workers=max_workers))
+        if udp_result is not None:
+            summary["udp"] = udp_result
+
+        if 161 in effective_udp_ports:
+            summary["snmp"] = _stage("snmp", lambda: snmp_community_probe(
+                ip, store=store, target=target, timeout=timeout, communities=snmp_communities))
+        else:
+            _stage("snmp", None, skipped_reason="port 161 is not in the UDP port list for this run")
+
+        if check_ipmi_enabled:
+            summary["ipmi"] = _stage("ipmi", lambda: check_ipmi_exposure(
+                ip, store=store, target=target, timeout=timeout))
+        else:
+            _stage("ipmi", None, skipped_reason="disabled by caller (check_ipmi_enabled=False)")
+
+        if check_db_exposure_enabled:
+            summary["db_exposure"] = _stage("db_exposure", lambda: check_database_exposure(
+                ip, store=store, target=target, timeout=timeout))
+        else:
+            _stage("db_exposure", None,
+                   skipped_reason="disabled by caller (check_db_exposure_enabled=False)")
+
+        if fingerprint_os_enabled:
+            os_port = None
+            os_probe = b""
+            if summary["snmp"] and summary["snmp"].get("accepted"):
+                os_port = 161
+                os_probe = _snmp_build_get_request(
+                    summary["snmp"]["accepted"][0]["community"], request_id=999)
+            elif summary["ipmi"] and summary["ipmi"].get("exposed"):
+                os_port = 623
+                os_probe = _RMCP_PRESENCE_PING
+            if os_port:
+                summary["os_fingerprint"] = _stage("os_fingerprint", lambda: fingerprint_os_ttl(
+                    ip, os_port, probe=os_probe, store=store, target=target, timeout=timeout))
+            else:
+                _stage("os_fingerprint", None, skipped_reason=(
+                    "no UDP port confirmed to respond (SNMP/IPMI) was available to sample a TTL from"
+                ))
+        else:
+            _stage("os_fingerprint", None,
+                   skipped_reason="disabled by caller (fingerprint_os_enabled=False)")
+    except KeyboardInterrupt:
+        # Everything discovered so far is already persisted; record the
+        # partial outcome, then let the interrupt continue to the orchestrator.
+        summary["status"] = RUN_INTERRUPTED
+        for name in _ALL_STAGE_NAMES:
+            summary["stages"].setdefault(name, {"status": STAGE_NOT_REACHED})
+        summary["finished_at"] = _now()
+        summary["interrupted"] = True
+        raise ActiveReconInterrupted(summary)
+
+    # A run is only "completed" if nothing failed and nothing came back
+    # inconclusive. Otherwise the caller must not read empty results as
+    # "nothing is there".
+    degraded = summary["errors"] or any(
+        stage.get("status") in (STAGE_FAILED, STAGE_INCONCLUSIVE)
+        for stage in summary["stages"].values()
+    )
+    summary["status"] = RUN_COMPLETED_WITH_ERRORS if degraded else RUN_COMPLETED
     summary["finished_at"] = _now()
     return summary
 
@@ -1599,6 +2435,12 @@ def run_active_recon(
 # ---------------------------------------------------------------------------
 
 def _parse_ports(raw: Optional[str]) -> Optional[List[int]]:
+    """
+    Parse a comma-separated port list, accepting "N" and "A-B" ranges.
+
+    Raises ValueError with an actionable message rather than letting int()'s
+    raw "invalid literal" surface out of the CLI.
+    """
     if not raw:
         return None
     ports: List[int] = []
@@ -1606,8 +2448,22 @@ def _parse_ports(raw: Optional[str]) -> Optional[List[int]]:
         part = part.strip()
         if not part:
             continue
-        ports.append(int(part))
-    return ports
+        if "-" in part.lstrip("-"):
+            lo_raw, _, hi_raw = part.partition("-")
+            try:
+                lo, hi = int(lo_raw), int(hi_raw)
+            except ValueError:
+                raise ValueError(f"invalid port range {part!r}; expected LOW-HIGH, e.g. 20-25") from None
+            if lo > hi:
+                raise ValueError(f"invalid port range {part!r}: {lo} is greater than {hi}")
+            ports.extend(range(lo, hi + 1))
+            continue
+        try:
+            ports.append(int(part))
+        except ValueError:
+            raise ValueError(f"invalid port {part!r}; ports must be integers between "
+                             f"{MIN_PORT} and {MAX_PORT}") from None
+    return normalize_ports(ports)
 
 
 def _main() -> None:
@@ -1641,6 +2497,14 @@ def _main() -> None:
     except ScopeError as exc:
         print(f"[scope error] {exc}")
         raise SystemExit(2)
+    except ValueError as exc:
+        print(f"[input error] {exc}")
+        raise SystemExit(2)
+    except ActiveReconInterrupted as exc:
+        # Discoveries are already persisted; report the partial run rather
+        # than exiting as if nothing had been found.
+        print(json.dumps(exc.summary, indent=2))
+        raise SystemExit(130)
 
     print(json.dumps(result, indent=2))
 
