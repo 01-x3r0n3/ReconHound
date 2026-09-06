@@ -125,6 +125,72 @@ proceed without redesigning anything context.md defines):
   9. Only GET requests are made, identical to endpoint_discovery.py's
      decision #6 and for the same reason: this module discovers surface,
      it does not exercise it.
+ 10. OPT-IN request safety. Decision #3 refuses to submit forms because of
+     state-changing side effects; GET /logout and GET /account/delete?id=7
+     are the same class of side effect reached by a different route. When
+     the operator passes `avoid_destructive=True`, a *discovered* candidate
+     whose whole path segment names such an action, or whose action
+     parameter names one, is recorded as discovered surface with
+     `fetched: false` and a `skip_reason` and never requested. This is
+     evidence-based, never a substring blacklist: matching is on whole path
+     segments with any file extension stripped, and a destructive *verb*
+     additionally requires corroboration that the URL acts on an object
+     (query parameters, an adjacent identifier, or mutable server-side
+     state). "/password/reset", "/newsletter/unsubscribe", "/docs/remove"
+     and "/blog/how-to-delete-a-file" therefore stay crawlable even when it
+     is enabled. The operator-supplied base_url is always exempt: naming it
+     as the crawl root IS the authorisation, the same distinction
+     validate_crawl_target draws against _candidate_in_scope.
+     It is OFF BY DEFAULT (`avoid_destructive=False`). context.md module 12
+     requires this module to follow internal links; withholding requests
+     narrows that by default, which context.md §2/§3 do not authorise, so
+     the reach of every pre-existing caller is preserved and the operator
+     opts in. The safety decision itself is crawler-owned — no other module
+     issues these requests — but it emits one request-safety reason code and
+     no auth taxonomy: identifying login/logout/password-reset/OAuth/SSO
+     surfaces as *intelligence* is http_analyzer.py's named responsibility
+     (context.md module 16), and this module does not duplicate it.
+ 11. Anti-bot challenge classification is DETECTION ONLY
+     (detect_challenge_indicators). Nothing bypasses, solves or evades a
+     challenge and no request is altered in response to one — that would be
+     WAF evasion, which context.md §4/§16 forbids. It exists to remove a
+     false positive from this module's own output: a Cloudflare
+     interstitial is ordinary HTML, so its challenge <form> was persisted
+     as a discovered application form and its challenge-platform <script>
+     as an application JavaScript reference. Such artefacts are still
+     recorded (nothing discovered is discarded) but marked
+     `challenge_artifact`, downgraded to LOW confidence, and never allowed
+     to raise a HIGH-priority file-upload surface. A CAPTCHA *widget* on an
+     otherwise normal page is classified separately and is not a block.
+
+COMPLETENESS: an empty result is not a negative result. The summary
+distinguishes a crawl that finished from one that was cut short —
+`depth_truncated`, `request_budget_exhausted`, `cancelled`, `rate_limited`,
+`challenge_pages`, `truncated_pages`, and the single `crawl_complete` flag
+that is False if any of them fired — so downstream can never read "no forms
+found" from a run that was blocked, throttled, interrupted or truncated as
+"this application has no forms" (context.md §8).
+
+INTENTIONAL v1 LIMITATIONS (deliberate boundaries, not oversights):
+  * No headless browser, no JavaScript execution, no SPA runtime route
+    discovery, no framework state extraction. Client-side-rendered routes
+    and fetch/XHR-constructed endpoints are therefore not discovered by
+    this module; JS *files* are discovered and handed to js_analyzer.py,
+    whose named responsibility deep JavaScript analysis is.
+  * No WebSocket protocol/frame analysis — indicators only (#7).
+  * No GraphQL introspection or schema intelligence — indicators only (#8);
+    schema work is api_recon.py's named responsibility.
+  * No gRPC-Web detection. context.md's line for this module names
+    WebSocket and GraphQL detection specifically; adding a third protocol
+    detector and its finding type is an architectural addition, not a local
+    fix (CLAUDE.md rule 12). API protocol intelligence belongs to
+    api_recon.py.
+  * No CAPTCHA solving, no WAF evasion, no stealth/human-like browsing —
+    prohibited, not deferred.
+  * No soft-404/catch-all body fingerprinting: this module only requests
+    URLs observed as real links on already-fetched pages, so the
+    guessed-path problem that heuristic exists for does not arise here
+    (decision #4).
 
 Every discovery is persisted immediately to <output_dir>/pending_assets.json
 via PendingAssetsStore (the same crash-safe, atomic-write store used by
@@ -171,6 +237,25 @@ DEFAULT_MAX_BODY_BYTES = 131072
 DEFAULT_MAX_DEPTH = 3
 DEFAULT_MAX_PAGES = 200
 DEFAULT_MAX_WORKERS = 10
+
+# Per-page and whole-run resource caps. A single hostile or merely enormous
+# page must not be able to allocate unbounded findings, task tuples or
+# evidence. Every cap records an error entry when it bites, so a truncated
+# page is never mistaken for a fully-parsed one (context.md §8: a bounded
+# result must say that it is bounded).
+DEFAULT_MAX_LINKS_PER_PAGE = 200
+DEFAULT_MAX_FORMS_PER_PAGE = 100
+DEFAULT_MAX_JS_REFS_PER_PAGE = 100
+DEFAULT_MAX_WS_INDICATORS_PER_PAGE = 50
+DEFAULT_MAX_PARAMS_PER_PAGE = 200
+#  * MAX_FRONTIER — next_frontier is built before the requests that would
+#    consume it are spent, so one wide level can allocate far more task
+#    tuples than the run could ever fetch (600 links x 60 pages measured at
+#    36,000 queued tuples for a 60-request budget).
+DEFAULT_MAX_FRONTIER = 20000
+# Attribute values are operator-visible evidence, not payloads: a 500 KB
+# placeholder/pattern attribute is persisted in full without this cap.
+_MAX_ATTR_VALUE_CHARS = 200
 
 _REDIRECT_STATUS_CODES = (301, 302, 303, 307, 308)
 
@@ -235,6 +320,92 @@ def _is_ip_literal(host: str) -> bool:
         return False
 
 
+def _idna_normalize(host: str) -> str:
+    """
+    Reduce a hostname to the single form scope comparisons are made in.
+
+    Without this, a target written as "münchen.de" and a hostname arriving as
+    "xn--mnchen-3ya.de" (or the reverse) compare unequal even though they are
+    the same host — silently dropping in-scope pages in one direction, and
+    making a homograph host look "different" from the target it impersonates
+    in the other. Both sides are folded to lowercase A-label form; anything
+    that will not encode is returned lowercased unchanged so the caller still
+    gets a deterministic comparison. Mirrors endpoint_discovery.py.
+    """
+    host = host.strip().rstrip(".").lower()
+    if not host or host.isascii():
+        return host
+    try:
+        return host.encode("idna").decode("ascii").lower()
+    except (UnicodeError, UnicodeDecodeError):
+        return host
+
+
+def _strip_userinfo(url: str) -> str:
+    """
+    Remove any `user:password@` component from a URL.
+
+    Every URL this module crawls beyond the seed comes out of a response
+    body, so credentials genuinely turn up in them. They must not be
+    re-sent, must not become part of an asset identity, and above all must
+    never be written into pending_assets.json — a plain-text file shared
+    with every other module and included in the report appendix (CLAUDE.md
+    rule 16). The netloc is rebuilt from the parsed host/port so the result
+    is also the canonical form for the visited set. Mirrors
+    endpoint_discovery.py.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if "@" not in parsed.netloc:
+            return url
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        return url
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"          # bare IPv6 literal
+    netloc = f"{host}:{port}" if port else host
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _remove_dot_segments(path: str) -> str:
+    """RFC 3986 §5.2.4 dot-segment removal, so /a/./b and /a/x/../b converge."""
+    out: List[str] = []
+    for segment in path.split("/"):
+        if segment == ".":
+            continue
+        if segment == "..":
+            if out and out[-1] not in ("", ".."):
+                out.pop()
+            continue
+        out.append(segment)
+    result = "/".join(out)
+    if path.startswith("/") and not result.startswith("/"):
+        result = "/" + result
+    return result or "/"
+
+
+_PRESERVE_UNRESERVED_RE = re.compile(r"%[0-9a-fA-F]{2}")
+
+
+def _normalize_percent_encoding(path: str) -> str:
+    """
+    Decode percent-escapes that encode RFC 3986 unreserved characters and
+    upper-case the rest, so "/%7Euser" and "/~user" — the same resource —
+    produce the same visited-set key instead of two crawls.
+    """
+    def _repl(match: "re.Match[str]") -> str:
+        raw = match.group(0)
+        try:
+            char = bytes.fromhex(raw[1:]).decode("ascii")
+        except (ValueError, UnicodeDecodeError):
+            return raw.upper()
+        if char.isalnum() or char in "-._~":
+            return char
+        return raw.upper()
+    return _PRESERVE_UNRESERVED_RE.sub(_repl, path)
+
+
 def _is_disallowed_redirect_ip(host: str) -> bool:
     """
     True if `host` is an IP literal in a private/loopback/link-local/
@@ -254,8 +425,10 @@ def _is_disallowed_redirect_ip(host: str) -> bool:
 
 
 def _in_scope_host(hostname: str, target: str) -> bool:
-    hostname = hostname.strip().rstrip(".").lower()
-    target = target.strip().rstrip(".").lower()
+    hostname = _idna_normalize(hostname)
+    target = _idna_normalize(target)
+    if not hostname or not target:
+        return False
     return hostname == target or hostname.endswith("." + target)
 
 
@@ -270,19 +443,38 @@ def validate_crawl_target(url: str, target: Optional[str] = None) -> str:
         raise ScopeError("URL must be a non-empty string.")
 
     candidate = url.strip()
-    parsed = urllib.parse.urlsplit(candidate)
+    # A CR, LF, NUL or tab inside a URL is never legitimate. urlsplit silently
+    # *removes* newlines and tabs, so "http://exam\tple.com/" was validated as
+    # the in-scope host "example.com" and then handed to requests still
+    # carrying the raw byte. Rejecting it here names the real problem instead
+    # of surfacing an opaque transport error later (mirrors
+    # endpoint_discovery.validate_endpoint_target).
+    if any(ch in candidate for ch in "\r\n\t\x00"):
+        raise ScopeError(f"URL contains control characters: {url!r}")
+
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+        hostname = parsed.hostname
+    except ValueError as exc:
+        # urlsplit raises on malformed IPv6 brackets and out-of-range ports;
+        # letting that escape turned a scope decision into an uncaught
+        # ValueError the orchestrator records as a module crash rather than a
+        # scope rejection.
+        raise ScopeError(f"URL cannot be parsed: {url!r} ({exc})") from exc
 
     if parsed.scheme not in ("http", "https"):
         raise ScopeError(f"URL must use http:// or https://, not {parsed.scheme!r}: {url!r}")
 
-    hostname = parsed.hostname
     if not hostname:
         raise ScopeError(f"URL must include a hostname: {url!r}")
 
     if target and not _is_ip_literal(hostname) and not _in_scope_host(hostname, target):
         raise ScopeError(f"URL host {hostname!r} is not in scope for target {target!r}: {url!r}")
 
-    return candidate
+    # Credentials in an operator-supplied URL are dropped rather than
+    # rejected: the URL is legitimate, but re-sending and persisting the
+    # credential is not (see _strip_userinfo).
+    return _strip_userinfo(candidate)
 
 
 def _candidate_in_scope(url: str, target: Optional[str]) -> bool:
@@ -301,13 +493,18 @@ def _candidate_in_scope(url: str, target: Optional[str]) -> bool:
     an in-scope host, and every same-host link the crawler finds on that
     target necessarily resolves to that same address.
     """
+    if not isinstance(url, str) or any(ch in url for ch in "\r\n\t\x00"):
+        # Same reasoning as validate_crawl_target: a control character in a
+        # discovered link is never legitimate, and urlsplit's silent stripping
+        # would scope-check a different string than the one requests is given.
+        return False
     try:
         parsed = urllib.parse.urlsplit(url)
-    except Exception:
+        hostname = parsed.hostname
+    except ValueError:
         return False
     if parsed.scheme not in ("http", "https"):
         return False
-    hostname = parsed.hostname
     if not hostname:
         return False
 
@@ -316,7 +513,7 @@ def _candidate_in_scope(url: str, target: Optional[str]) -> bool:
         # _in_scope_host's exact-match semantics; IP addresses have no
         # subdomain concept). No additional private-range check — the
         # operator already authorized this exact address as the target.
-        return hostname.strip().rstrip(".").lower() == target.strip().rstrip(".").lower()
+        return _idna_normalize(hostname) == _idna_normalize(target)
 
     if _is_ip_literal(hostname):
         # IP-literal candidate under a domain-name target (or no target):
@@ -405,7 +602,24 @@ class PendingAssetsStore:
         self.output_dir = output_dir
         self.path = os.path.join(output_dir, filename)
         self._lock = threading.Lock()
+        # Serialized body of everything this store has written, kept so an
+        # append does not have to re-encode the whole file (see
+        # _atomic_write_body). `_stamp` is the (mtime_ns, size) of the file as
+        # this store last left it; anything else means somebody else wrote it
+        # and the cache is void.
+        self._serialized: Optional[str] = None
+        self._stamp: Optional[Tuple[int, int]] = None
         os.makedirs(self.output_dir, exist_ok=True)
+
+    def _current_stamp(self) -> Optional[Tuple[int, int]]:
+        try:
+            info = os.stat(self.path)
+        except OSError:
+            return None
+        return (info.st_mtime_ns, info.st_size)
+
+    def _cache_is_current(self) -> bool:
+        return self._serialized is not None and self._stamp == self._current_stamp()
 
     def _read_all(self) -> List[Dict[str, Any]]:
         if not os.path.exists(self.path):
@@ -427,29 +641,117 @@ class PendingAssetsStore:
 
     def add(self, finding: Dict[str, Any]) -> Dict[str, Any]:
         """Append one finding and persist immediately. Returns the finding."""
-        with self._lock:
-            records = self._read_all()
-            records.append(finding)
-            self._atomic_write(records)
+        self.add_many([finding])
         return finding
 
-    def _atomic_write(self, records: List[Dict[str, Any]]) -> None:
+    def add_many(self, findings: List[Dict[str, Any]]) -> int:
+        """
+        Append a batch of findings in ONE read + ONE atomic write.
+
+        add() rewrites the whole shared file per finding, which is quadratic
+        in the number of records already on disk — and one crawled page emits
+        a page record plus every form, parameter, JS reference and indicator
+        found on it. Measured on this repository with the previous per-finding
+        add(): 100 findings 0.05s, 300 0.40s, 600 1.52s, 1000 4.33s, while a
+        mocked 60-page crawl spent 15.7s almost entirely in persistence.
+        Batching one page's records into a single write keeps a full run
+        linear in practice.
+
+        Crash-safety is unchanged and slightly stronger: still one
+        write-to-temp + os.replace, so a page's records are all-or-nothing
+        rather than half-applied. Mirrors endpoint_discovery.py/
+        active_recon.py, which share this output file. Returns the number of
+        findings written.
+        """
+        if not findings:
+            return 0
+        with self._lock:
+            if not self._cache_is_current():
+                # First write of this run, or the file changed underneath us:
+                # re-encode from what is actually on disk.
+                self._serialized = self._encode_body(self._read_all())
+            addition = self._encode_body(findings)
+            body = f"{self._serialized},\n{addition}" if self._serialized else addition
+            self._atomic_write_body(body)
+            self._serialized = body
+        return len(findings)
+
+    @staticmethod
+    def _encode_body(records: List[Dict[str, Any]]) -> str:
+        """Serialize records as the *inside* of the JSON array (no brackets)."""
+        if not records:
+            return ""
+        return ",\n".join("  " + json.dumps(r, indent=2).replace("\n", "\n  ") for r in records)
+
+    def _atomic_write_body(self, body: str) -> None:
+        """
+        Write "[<body>]" via write-to-temp + os.replace + directory fsync.
+
+        The file format, the indentation and the crash-safety guarantee are
+        exactly as before; what changed is that already-written records are no
+        longer re-encoded on every append, and the rename itself is now
+        durably committed.
+        """
         dir_name = os.path.dirname(self.path) or "."
         fd, tmp_path = tempfile.mkstemp(prefix=".pending_assets_", dir=dir_name)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(records, f, indent=2)
+                f.write("[\n" + body + "\n]" if body else "[]")
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, self.path)
+            self._fsync_dir(dir_name)
+            self._stamp = self._current_stamp()
         except BaseException:
+            self._serialized = None
+            self._stamp = None
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             raise
 
+    def _atomic_write(self, records: List[Dict[str, Any]]) -> None:
+        """Replace the file with exactly `records` (kept for direct callers)."""
+        encoded = self._encode_body(records)
+        self._atomic_write_body(encoded)
+        self._serialized = encoded
+
+    @staticmethod
+    def _fsync_dir(dir_name: str) -> None:
+        """
+        Durably commit the os.replace() rename itself.
+
+        Without this the replacement file's *contents* are on disk but the
+        directory entry pointing at them may not be, so a power loss can still
+        resurrect the pre-replace file and lose every discovery appended
+        since. Best-effort: some platforms/filesystems refuse to fsync a
+        directory. Mirrors passive_recon.py/active_recon.py, which share this
+        file.
+        """
+        try:
+            fd = os.open(dir_name, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
     def all(self) -> List[Dict[str, Any]]:
         with self._lock:
             return self._read_all()
+
+
+# A persistence attempt can fail in more ways than PersistenceError: the disk
+# fills or the path loses permissions (OSError), or a value reached the store
+# that json.dump cannot serialise (TypeError/ValueError). Catching only
+# PersistenceError meant those escaped _persist_form/_process_page, killed the
+# worker task, and took the *completed discovery* down with them — a measured
+# OSError on one form write lost that page's entire record, its parameters,
+# its JS references and its HIGH-priority file-upload surface. That is exactly
+# the outcome context.md §12.11 forbids.
+_PERSISTENCE_FAILURES = (PersistenceError, OSError, TypeError, ValueError)
 
 
 def _safe_store_add(store: Optional["PendingAssetsStore"], finding: Dict[str, Any]) -> Optional[str]:
@@ -463,7 +765,24 @@ def _safe_store_add(store: Optional["PendingAssetsStore"], finding: Dict[str, An
     try:
         store.add(finding)
         return None
-    except PersistenceError as exc:
+    except _PERSISTENCE_FAILURES as exc:
+        return str(exc)
+
+
+def _safe_store_add_many(
+    store: Optional["PendingAssetsStore"], findings: List[Dict[str, Any]],
+) -> Optional[str]:
+    """
+    store.add_many() wrapped identically to _safe_store_add. Returns None on
+    success, or an error message; the in-memory findings are never discarded
+    because persistence failed.
+    """
+    if store is None or not findings:
+        return None
+    try:
+        store.add_many(findings)
+        return None
+    except _PERSISTENCE_FAILURES as exc:
         return str(exc)
 
 
@@ -489,21 +808,47 @@ def _origin_of(url: str) -> str:
 
 def _normalize_url(url: str) -> str:
     """
-    Normalize scheme/host casing, default ports, duplicate slashes, and
-    query-parameter order, for visited-set dedup (responsibility #1:
-    "avoid duplicate URL processing" / "prevent infinite crawling loops").
+    Canonical form of a URL, used as the visited-set key so the same resource
+    is never crawled twice (responsibility #1: "avoid duplicate URL
+    processing" / "prevent infinite crawling loops").
+
+    Normalizes scheme/host casing, IDN form, the hostname's trailing root dot,
+    userinfo, default ports, duplicate slashes, dot segments, redundant
+    percent-encoding, query-parameter order, and the fragment (which is never
+    sent to a server and so can never distinguish two requests).
+
+    Every one of those was a way to re-fetch a page the crawler had already
+    seen: "/a/../b" and "/b", "/%7Eu" and "/~u", "example.com." and
+    "example.com", and — worst, because it also leaked a secret into the
+    visited set and from there into evidence — "user:pass@host" and "host".
+    Under a spider trap each is an unbounded duplicate-URL generator.
     """
-    parsed = urllib.parse.urlsplit(url)
-    scheme = parsed.scheme.lower()
-    netloc = parsed.netloc.lower()
-    if ":" in netloc:
-        host, _, port = netloc.rpartition(":")
-        if (scheme == "http" and port == "80") or (scheme == "https" and port == "443"):
-            netloc = host
-    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    try:
+        parsed = urllib.parse.urlsplit(_strip_userinfo(url))
+        hostname = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        # Unparseable input still needs a deterministic, collision-free key
+        # rather than an exception out of the dedup path.
+        return url.strip()
+
+    scheme = (parsed.scheme or "").lower()
+    host = _idna_normalize(hostname)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"          # bare IPv6 literal
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        host = f"{host}:{port}"
+
+    # Decode-then-remove, in that order: "%2e%2e" is an encoded ".." and has
+    # to become one before dot segments are collapsed, or "/a/%2e%2e/b" and
+    # "/b" stay two visited-set keys for one resource. Only *unreserved*
+    # characters are decoded, so "%2F" never turns into a path separator.
+    path = _remove_dot_segments(_normalize_percent_encoding(re.sub(r"/{2,}", "/", parsed.path or "/")))
     query = urllib.parse.urlencode(sorted(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)))
     fragment = ""  # fragments never distinguish a distinct server-side resource
-    return urllib.parse.urlunsplit((scheme, netloc, path, query, fragment))
+    return urllib.parse.urlunsplit((scheme, host, path, query, fragment))
 
 
 def _looks_textual(content_type: Optional[str], body: Optional[str]) -> bool:
@@ -570,7 +915,35 @@ def fetch_url(
         try:
             raw = resp.raw.read(max_body_bytes + 1, decode_content=True)
         except Exception:
-            raw = resp.content[:max_body_bytes + 1]
+            # Fallback for adapters/mocks without a usable .raw. It must stay
+            # bounded: `resp.content` materialises the *entire* body before
+            # the slice runs, so a 50 MB response (or a decompression bomb)
+            # was fully resident in memory per worker before being truncated
+            # to 128 KB. iter_content stops as soon as the cap is reached.
+            raw = b""
+            try:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    raw += chunk
+                    if len(raw) > max_body_bytes:
+                        break
+                raw = raw[: max_body_bytes + 1]
+            except Exception:
+                # Last resort for adapters exposing neither a readable .raw
+                # nor a working iter_content. `.content` materialises the
+                # whole body, so it is used only when the server declared a
+                # size that is safe to hold; an undeclared or oversized body
+                # is reported as unread rather than swallowed whole.
+                declared = _ci_get(dict(getattr(resp, "headers", {}) or {}), "Content-Length")
+                hard_cap = max_body_bytes * 8
+                try:
+                    if declared is not None and int(declared) > hard_cap:
+                        raise ValueError(f"declared body of {declared} bytes exceeds the read cap")
+                    raw = resp.content[: max_body_bytes + 1]
+                except Exception as body_exc:
+                    raw = b""
+                    result["body_read_error"] = str(body_exc)
         truncated = len(raw) > max_body_bytes
         body_bytes = raw[:max_body_bytes]
         try:
@@ -607,14 +980,28 @@ def fetch_url(
 # ---------------------------------------------------------------------------
 
 def classify_response(resp: Dict[str, Any]) -> Tuple[str, str, List[str]]:
-    """Classify a fetch_url() result into a discovery_type + confidence + supporting notes."""
+    """
+    Classify a fetch_url() result into a discovery_type + confidence +
+    supporting notes.
+
+    Status-based only, deliberately (see module docstring, decision #4).
+    What it must never do is turn a *refusal to answer* into a statement
+    about the application: 503 stays a server error rather than being
+    reported as rate limiting (a 503 has many causes), 401/403 stay
+    "access_restricted" rather than being read as "an API lives here", and
+    only an explicit 429 is called rate limiting.
+    """
     status = resp.get("status_code")
     if status is None:
         return "error", CONFIDENCE_LOW, ["no status code available (request failed)"]
     if status == 404:
         return "not_found", CONFIDENCE_HIGH, []
     if status == 429:
-        return "rate_limited", CONFIDENCE_LOW, ["HTTP 429 Too Many Requests — crawl may be incomplete beyond this point"]
+        notes = ["HTTP 429 Too Many Requests — crawl may be incomplete beyond this point"]
+        retry_after = _ci_get(resp.get("headers") or {}, "Retry-After")
+        if retry_after:
+            notes.append(f"Retry-After: {retry_after}")
+        return "rate_limited", CONFIDENCE_LOW, notes
     if status in _REDIRECT_STATUS_CODES:
         return "redirect", CONFIDENCE_MEDIUM, [f"HTTP {status} redirect response"]
     if status in (401, 403):
@@ -740,18 +1127,43 @@ def extract_header_parameter_hints(body: Optional[str], headers: Optional[Dict[s
 # module docstring, decision #2)
 # ---------------------------------------------------------------------------
 
-def extract_page_links(body: str, page_url: str, target: Optional[str] = None) -> List[Dict[str, Any]]:
+def _parse_html(body: Optional[str]) -> Optional[Any]:
+    """
+    Parse `body` once, returning None on empty/unparseable input.
+
+    extract_page_links, extract_forms and extract_javascript_references each
+    used to build their own BeautifulSoup — three full parses of the same
+    document per page, measured at 3 constructions for a single page. They
+    now accept an already-parsed `soup`, and _process_page passes one.
+    """
+    if not body:
+        return None
+    try:
+        return BeautifulSoup(body, "html.parser")
+    except Exception:
+        return None
+
+
+def extract_page_links(
+    body: str, page_url: str, target: Optional[str] = None, soup: Optional[Any] = None,
+    max_links: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
     Extract navigable <a href>/<iframe src> links from `body`, resolved to
     absolute URLs. Each entry preserves discovery context (tag/attribute)
     and an `in_scope` flag (candidates are not silently dropped — see
     responsibility #11 and _candidate_in_scope).
+
+    `max_links` stops the scan once that many distinct links have been
+    collected. The caller capped the *result* before, which bounded the
+    frontier but not the work: a 3,000-link page still cost 3,000 URL
+    resolutions, normalizations and scope checks per page, measured at 74s
+    and 75 MB for a 100-page crawl. Stopping the scan is the same set of
+    links (the cap was always applied to the head of the deduplicated list)
+    at a bounded cost.
     """
-    if not body:
-        return []
-    try:
-        soup = BeautifulSoup(body, "html.parser")
-    except Exception:
+    soup = soup if soup is not None else _parse_html(body)
+    if soup is None:
         return []
 
     out: List[Dict[str, Any]] = []
@@ -768,8 +1180,12 @@ def extract_page_links(body: str, page_url: str, target: Optional[str] = None) -
             ref = value.strip()
             if not ref or ref.startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
                 continue
+            if any(ch in ref for ch in "\r\n\t\x00"):
+                # urlsplit strips these silently, so the URL that gets
+                # scope-checked would not be the URL that gets requested.
+                continue
             try:
-                abs_url = urllib.parse.urljoin(page_url, ref)
+                abs_url = _strip_userinfo(urllib.parse.urljoin(page_url, ref))
             except Exception:
                 continue
             parsed = urllib.parse.urlsplit(abs_url)
@@ -779,9 +1195,13 @@ def extract_page_links(body: str, page_url: str, target: Optional[str] = None) -
             if normalized in seen:
                 continue
             seen.add(normalized)
+            if max_links is not None and len(out) >= max_links:
+                return out
             out.append({
                 "url": abs_url,
-                "raw": ref,
+                # Credential-stripped, like `url`: `raw` is descriptive
+                # provenance, not a reason to keep a password around.
+                "raw": _strip_userinfo(ref) if "@" in ref else ref,
                 "tag": f"{tag_name}[{attr}]",
                 "in_scope": _candidate_in_scope(abs_url, target),
             })
@@ -792,16 +1212,16 @@ def extract_page_links(body: str, page_url: str, target: Optional[str] = None) -
 # 3. Form discovery
 # ---------------------------------------------------------------------------
 
-def extract_forms(body: str, page_url: str) -> List[Dict[str, Any]]:
+def extract_forms(body: str, page_url: str, soup: Optional[Any] = None) -> List[Dict[str, Any]]:
     """
     HTML <form> structure extraction: action, method, enctype, and every
     named field's type + relevant attributes. Malformed HTML degrades to
     an empty result rather than raising.
     """
-    if not body:
+    soup = soup if soup is not None else _parse_html(body)
+    if soup is None:
         return []
     try:
-        soup = BeautifulSoup(body, "html.parser")
         forms = soup.find_all("form")
     except Exception:
         return []
@@ -812,8 +1232,11 @@ def extract_forms(body: str, page_url: str) -> List[Dict[str, Any]]:
         if method not in ("GET", "POST"):
             method = "GET"
         raw_action = form.get("action")
+        if isinstance(raw_action, str) and "@" in raw_action:
+            raw_action = _strip_userinfo(raw_action)
         try:
-            resolved_action = urllib.parse.urljoin(page_url, raw_action) if raw_action else page_url
+            resolved_action = _strip_userinfo(
+                urllib.parse.urljoin(page_url, raw_action)) if raw_action else page_url
         except Exception:
             resolved_action = page_url
         enctype = (form.get("enctype") or "application/x-www-form-urlencoded").strip().lower()
@@ -827,9 +1250,15 @@ def extract_forms(body: str, page_url: str) -> List[Dict[str, Any]]:
         for field in field_tags:
             field_type = (field.get("type") or ("select" if field.name == "select" else "text")).lower()
             entry: Dict[str, Any] = {"name": field.get("name"), "type": field_type}
-            attrs = {k: field.get(k) for k in _FIELD_ATTR_KEYS if field.get(k) is not None}
+            # Attribute values are operator-visible evidence, not payloads: a
+            # page can declare a 500 KB placeholder/pattern and every byte of
+            # it was previously persisted into pending_assets.json.
+            attrs = {
+                k: (str(field.get(k))[:_MAX_ATTR_VALUE_CHARS] if isinstance(field.get(k), str) else field.get(k))
+                for k in _FIELD_ATTR_KEYS if field.get(k) is not None
+            }
             if field_type in ("hidden", "submit") and field.get("value") is not None:
-                attrs["value"] = str(field.get("value"))[:200]
+                attrs["value"] = str(field.get("value"))[:_MAX_ATTR_VALUE_CHARS]
             if attrs:
                 entry["attributes"] = attrs
             fields.append(entry)
@@ -954,12 +1383,18 @@ def build_file_upload_surface(form: Dict[str, Any], classification: Dict[str, An
 # docstring, decision #2)
 # ---------------------------------------------------------------------------
 
-def extract_javascript_references(body: str, page_url: str, target: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Extract <script src> references, resolved to absolute URLs, deduplicated per page."""
-    if not body:
+def extract_javascript_references(
+    body: str, page_url: str, target: Optional[str] = None, soup: Optional[Any] = None,
+    max_refs: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Extract <script src> references, resolved to absolute URLs, deduplicated
+    per page. `max_refs` bounds the scan itself — see extract_page_links.
+    """
+    soup = soup if soup is not None else _parse_html(body)
+    if soup is None:
         return []
     try:
-        soup = BeautifulSoup(body, "html.parser")
         script_tags = soup.find_all("script")
     except Exception:
         return []
@@ -971,10 +1406,10 @@ def extract_javascript_references(body: str, page_url: str, target: Optional[str
         if not src:
             continue
         src = src.strip()
-        if not src:
+        if not src or any(ch in src for ch in "\r\n\t\x00"):
             continue
         try:
-            abs_url = urllib.parse.urljoin(page_url, src)
+            abs_url = _strip_userinfo(urllib.parse.urljoin(page_url, src))
         except Exception:
             continue
         parsed = urllib.parse.urlsplit(abs_url)
@@ -984,11 +1419,16 @@ def extract_javascript_references(body: str, page_url: str, target: Optional[str
         if normalized in seen:
             continue
         seen.add(normalized)
+        if max_refs is not None and len(out) >= max_refs:
+            return out
         out.append({
             "url": abs_url,
             "source_page": page_url,
             "in_scope": _candidate_in_scope(abs_url, target),
-            "evidence": [f"<script src={src!r}> referenced on {page_url}"],
+            # The resolved (credential-stripped) URL, never the raw attribute:
+            # a `src` of "https://u:p@host/a.js" put the password verbatim
+            # into pending_assets.json and from there into the report.
+            "evidence": [f"<script src> referencing {abs_url} found on {page_url}"],
         })
     return out
 
@@ -996,6 +1436,34 @@ def extract_javascript_references(body: str, page_url: str, target: Optional[str
 # ---------------------------------------------------------------------------
 # 7. WebSocket detection
 # ---------------------------------------------------------------------------
+
+def _ws_endpoint_in_scope(endpoint: Optional[str], target: Optional[str]) -> Optional[bool]:
+    """
+    Whether a discovered ws(s):// endpoint belongs to the crawl scope.
+
+    Returns None when there is no literal endpoint to judge (a dynamically
+    constructed WebSocket URL), which is not the same as False and must not
+    be recorded as one. Scope is decided on the hostname exactly as for an
+    http(s) candidate; the ws/wss scheme is simply the http/https scheme of
+    the same origin under a different name.
+    """
+    if not endpoint:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(endpoint)
+        hostname = parsed.hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    if not target:
+        return not _is_disallowed_redirect_ip(hostname)
+    if _is_ip_literal(target) or _is_ip_literal(hostname):
+        if _is_ip_literal(hostname) and not _is_ip_literal(target):
+            return not _is_disallowed_redirect_ip(hostname)
+        return _idna_normalize(hostname) == _idna_normalize(target)
+    return _in_scope_host(hostname, target)
+
 
 def detect_websocket_indicators(body: str, page_url: str) -> List[Dict[str, Any]]:
     """
@@ -1006,7 +1474,11 @@ def detect_websocket_indicators(body: str, page_url: str) -> List[Dict[str, Any]
     if not body:
         return []
     out: List[Dict[str, Any]] = []
-    literal_matches = sorted(set(m.rstrip(").,;'\"") for m in _WS_LITERAL_RE.findall(body)))
+    # Credential-stripped: a page can carry "wss://user:pass@host/ws", and
+    # the endpoint is persisted and rendered in the report appendix.
+    literal_matches = sorted(set(
+        _strip_userinfo(m.rstrip(").,;'\"")) for m in _WS_LITERAL_RE.findall(body)
+    ))
     for endpoint in literal_matches:
         out.append({
             "endpoint": endpoint,
@@ -1080,22 +1552,304 @@ def detect_graphql_indicators(
 
 
 # ---------------------------------------------------------------------------
+# Anti-bot challenge / CAPTCHA surface classification
+#
+# DETECTION ONLY. Nothing here bypasses, solves, or evades a challenge, and
+# no request is altered in response to one — that would be WAF evasion, which
+# context.md §4/§16 and this module's SECURITY BOUNDARIES forbid outright.
+# The reason it exists is a false positive in this module's own output: a
+# Cloudflare interstitial is served as ordinary HTML, so its challenge <form>
+# was persisted as a discovered application form and its challenge-platform
+# <script> as an application JavaScript reference, while the page record
+# claimed a normal response. Downstream then held a form and an endpoint that
+# do not exist in the target application.
+# ---------------------------------------------------------------------------
+
+# Vendor-specific header names. A header is a far stronger signal than page
+# text, because it cannot be produced by the application merely mentioning a
+# vendor's name in its own content.
+_CHALLENGE_HEADERS = (
+    ("cf-mitigated", "cloudflare"),
+    ("cf-chl-bypass", "cloudflare"),
+    ("x-datadome", "datadome"),
+    ("x-datadome-cid", "datadome"),
+    ("x-iinfo", "imperva_incapsula"),
+    ("x-px-block", "perimeterx"),
+)
+
+# Markers that only appear in an actual interstitial, not in a page that
+# happens to discuss bot protection. Each is a vendor-specific path or DOM id
+# emitted by the challenge itself.
+_BOT_CHALLENGE_MARKERS = (
+    (re.compile(r"/cdn-cgi/challenge-platform/", re.IGNORECASE), "cloudflare"),
+    (re.compile(r"\bcf-challenge-running\b", re.IGNORECASE), "cloudflare"),
+    (re.compile(r"\bcf_chl_opt\b", re.IGNORECASE), "cloudflare"),
+    (re.compile(r"/cdn-cgi/l/chk_jschl", re.IGNORECASE), "cloudflare"),
+    (re.compile(r"\bcaptcha-delivery\.com\b", re.IGNORECASE), "datadome"),
+    (re.compile(r"\b_Incapsula_Resource\b", re.IGNORECASE), "imperva_incapsula"),
+    (re.compile(r"\bak-challenge\b|/akam/\d+/", re.IGNORECASE), "akamai"),
+    (re.compile(r"\b_pxhd\b|/px/captcha", re.IGNORECASE), "perimeterx"),
+)
+
+# A CAPTCHA *widget* is not a block: an ordinary signup or contact form can
+# carry one. It is recorded as surface intelligence with its own type, and
+# never treated as evidence that the crawl was refused.
+_CAPTCHA_WIDGET_MARKERS = (
+    (re.compile(r"\bg-recaptcha\b|www\.google\.com/recaptcha/", re.IGNORECASE), "recaptcha"),
+    (re.compile(r"\bh-captcha\b|\bhcaptcha\.com\b", re.IGNORECASE), "hcaptcha"),
+    (re.compile(r"\bcf-turnstile\b|challenges\.cloudflare\.com/turnstile", re.IGNORECASE), "turnstile"),
+)
+
+
+def detect_challenge_indicators(
+    body: Optional[str], headers: Optional[Dict[str, str]] = None, status_code: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Classify a response as an anti-bot interstitial, a page carrying a CAPTCHA
+    widget, or neither. Returns None when there is no supporting evidence.
+
+    Deliberately evidence-based rather than keyword-based: the bare words
+    "captcha", "cloudflare" or "blocked" appearing in page text prove nothing
+    (a security blog would match all three), so only vendor headers and
+    vendor-emitted markers count. `kind` is "bot_challenge" when the response
+    IS the challenge — the crawler was refused and the body is not the
+    application's — or "captcha_widget" when a normal page merely embeds one.
+    """
+    header_map = headers or {}
+    evidence: List[str] = []
+    vendors: List[str] = []
+
+    for name, vendor in _CHALLENGE_HEADERS:
+        value = _ci_get(header_map, name)
+        if value is not None:
+            evidence.append(f"Anti-bot vendor response header {name!r} present (value: {value!r})")
+            vendors.append(vendor)
+
+    haystack = body or ""
+    for pattern, vendor in _BOT_CHALLENGE_MARKERS:
+        match = pattern.search(haystack)
+        if match:
+            evidence.append(f"Challenge-interstitial marker {match.group(0)!r} found in response body")
+            vendors.append(vendor)
+
+    if evidence:
+        # Confidence reflects how the evidence was obtained, not how alarming
+        # it is: a vendor header cannot be forged by page content, body
+        # markers can in principle appear in a page quoting a challenge.
+        from_header = any(_ci_get(header_map, n) is not None for n, _ in _CHALLENGE_HEADERS)
+        return {
+            "kind": "bot_challenge",
+            "vendors": sorted(set(vendors)),
+            "confidence": CONFIDENCE_HIGH if from_header else CONFIDENCE_MEDIUM,
+            "status_code": status_code,
+            "evidence": evidence + [
+                "Response is an anti-bot challenge, not application content; forms, links and "
+                "scripts parsed from it describe the challenge and not the target application",
+            ],
+        }
+
+    widget_evidence: List[str] = []
+    widget_vendors: List[str] = []
+    for pattern, vendor in _CAPTCHA_WIDGET_MARKERS:
+        match = pattern.search(haystack)
+        if match:
+            widget_evidence.append(f"CAPTCHA widget marker {match.group(0)!r} found in page content")
+            widget_vendors.append(vendor)
+    if widget_evidence:
+        return {
+            "kind": "captcha_widget",
+            "vendors": sorted(set(widget_vendors)),
+            "confidence": CONFIDENCE_MEDIUM,
+            "status_code": status_code,
+            "evidence": widget_evidence + [
+                "A CAPTCHA widget on an otherwise normal page is surface intelligence, not a block; "
+                "the page content was parsed normally",
+            ],
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Request safety: state-changing candidates
+#
+# This module already refuses to submit forms because doing so risks
+# state-changing side effects (module docstring, decision #3). GET /logout and
+# GET /account/delete?id=7 are the same class of side effect reached by a
+# different route, and the crawler was following both unconditionally.
+#
+# SCOPE OF THIS CODE. It answers exactly one question the crawler alone can
+# answer, because the crawler alone issues these requests: "would requesting
+# this URL change server-side state?" It is deliberately NOT auth-surface
+# analysis. Identifying and reporting login/logout/password-reset/OAuth/SSO
+# surfaces as intelligence is http_analyzer.py's named responsibility
+# (context.md module 16), so this code emits a single request-safety reason
+# code, no auth taxonomy, and no auth-surface finding of its own. The output
+# is an ordinary `crawled_url` record that happens to carry fetched=false.
+#
+# The rule is evidence-based, never a substring blacklist: matching is on
+# whole path segments (with a file extension stripped) and on explicit action
+# query parameters, so "/blog/how-to-delete-a-file" and "/deleted-items" are
+# crawled normally while "/logout" and "?action=delete" are not. Nothing is
+# discarded — a skipped URL is still persisted as discovered surface, marked
+# as never fetched, with the reason recorded.
+#
+# Off by default (avoid_destructive=False), preserving the crawler's reach and
+# every pre-existing caller's behaviour; the operator opts in.
+# ---------------------------------------------------------------------------
+
+# Whole path segments that name an action, never a document. Requesting one
+# performs it.
+_ALWAYS_UNSAFE_SEGMENTS = frozenset({
+    "logout", "log-out", "logoff", "log-off", "signout", "sign-out",
+    "disconnect", "deauth", "deauthenticate", "endsession", "end-session",
+})
+# Destructive verbs. Matched only as a whole segment, AND only with
+# corroborating evidence that the URL is an *action* rather than a page named
+# after one — see classify_destructive_candidate. Without that second
+# requirement this list suppressed "/password/reset", "/newsletter/
+# unsubscribe" and "/docs/remove", which are ordinary GET-safe pages and
+# valuable reconnaissance surface.
+_DESTRUCTIVE_VERB_SEGMENTS = frozenset({
+    "delete", "destroy", "remove", "revoke", "purge", "wipe", "truncate",
+    "deactivate", "unsubscribe", "unpublish", "reset",
+})
+# Segments naming server-side state that a request can mutate. A destructive
+# verb applied to one of these acts on stored state whatever else the URL
+# looks like ("/api/session/destroy", "/auth/tokens/revoke"), so it
+# corroborates on its own. Used only to decide whether to send a request —
+# never to classify or report the URL as an authentication surface.
+_STATE_OBJECT_SEGMENTS = frozenset({
+    "session", "sessions", "auth", "authentication", "token", "tokens",
+    "credential", "credentials", "cookie", "cookies",
+})
+# Query parameters that name an action to perform.
+_ACTION_PARAM_NAMES = frozenset({"action", "do", "op", "cmd", "task", "mode", "method"})
+_DESTRUCTIVE_ACTION_VALUES = _ALWAYS_UNSAFE_SEGMENTS | _DESTRUCTIVE_VERB_SEGMENTS
+
+# One reason code. The crawler records *that* a request was withheld for
+# safety and what matched; deciding what the endpoint means is another
+# module's job.
+_STATE_CHANGING_REASON = "state_changing_endpoint"
+
+
+def _segment_stem(segment: str) -> str:
+    """"logout.php" -> "logout"; "logout-guide.html" -> "logout-guide"."""
+    return segment.rsplit(".", 1)[0].lower() if "." in segment else segment.lower()
+
+
+def _looks_like_identifier(segment: str) -> bool:
+    """A path segment that looks like a specific record's id."""
+    return bool(
+        re.fullmatch(r"\d+", segment) or _UUID_RE.match(segment) or _OBJECT_ID_RE.match(segment)
+    )
+
+
+def _withheld(matched: str, why: str) -> Dict[str, Any]:
+    """A uniform request-safety record. Confidence describes the *finding*
+    (this URL was discovered and not fetched), which is certain — not a
+    graded opinion about what the endpoint does."""
+    return {
+        "reason": _STATE_CHANGING_REASON,
+        "matched": matched,
+        "confidence": CONFIDENCE_HIGH,
+        "evidence": [
+            f"{why}; ReconHound performs discovery, not state change, so this URL was recorded "
+            f"as discovered surface and never requested",
+        ],
+    }
+
+
+def classify_destructive_candidate(url: str) -> Optional[Dict[str, Any]]:
+    """
+    Decide whether requesting `url` risks changing server-side state.
+
+    Returns None (safe to fetch) or a record carrying the matched evidence.
+    Conservative by construction: only a whole path segment or an explicit
+    action parameter counts, so an article *about* deleting things stays
+    crawlable while the endpoint that actually deletes does not.
+
+    This is a request-safety decision, not a classification of the endpoint.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    segments = [seg for seg in (parsed.path or "").split("/") if seg]
+    stems = [_segment_stem(seg) for seg in segments]
+
+    for stem in stems:
+        if stem in _ALWAYS_UNSAFE_SEGMENTS:
+            return _withheld(stem, f"URL path segment {stem!r} names an action rather than a "
+                                   f"document, so requesting it would perform it")
+    for index, stem in enumerate(stems):
+        if stem not in _DESTRUCTIVE_VERB_SEGMENTS:
+            continue
+        # Require evidence that this is an action on a specific object rather
+        # than a page whose name contains a verb: the URL carries parameters,
+        # an identifier sits next to the verb, or the verb is applied to
+        # mutable server-side state. "/password/reset" and "/docs/remove" are
+        # pages and stay crawlable; "/account/delete?id=7", "/posts/delete/42"
+        # and "/api/session/destroy" are actions and do not.
+        neighbours = stems[index - 1:index] + stems[index + 1:index + 2]
+        state_objects = [other for other in stems if other in _STATE_OBJECT_SEGMENTS]
+        trigger = None
+        if state_objects:
+            trigger = (f"it is applied to mutable server-side state "
+                       f"({state_objects[0]!r} in the path)")
+        elif parsed.query:
+            trigger = f"the URL carries query parameters ({parsed.query!r})"
+        elif any(_looks_like_identifier(seg) for seg in neighbours):
+            trigger = "an object identifier sits adjacent to the verb in the path"
+        if trigger:
+            return _withheld(stem, f"URL path segment {stem!r} names a destructive action and "
+                                   f"{trigger}")
+    for name, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        if name.lower() in _ACTION_PARAM_NAMES and value.strip().lower() in _DESTRUCTIVE_ACTION_VALUES:
+            return _withheld(f"{name}={value}",
+                             f"URL carries action parameter {name}={value!r}, naming an "
+                             f"operation that changes state")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Crawl state (visited-set, request budget, error log, dedup sets — shared
 # by the whole crawl)
 # ---------------------------------------------------------------------------
 
+# An error log is evidence, but it is also unbounded input: a site that
+# refuses every request would otherwise grow one entry per request forever.
+_MAX_RECORDED_ERRORS = 1000
+
+
 class _CrawlState:
-    def __init__(self, target: str, store: Optional[PendingAssetsStore], max_pages: int, max_depth: int):
+    def __init__(
+        self, target: str, store: Optional[PendingAssetsStore], max_pages: int, max_depth: int,
+        avoid_destructive: bool = False,
+    ):
         self.target = target
         self.store = store
         self.max_pages = max_pages
         self.max_depth = max_depth
+        self.avoid_destructive = avoid_destructive
         self._lock = threading.Lock()
         self._visited: Set[str] = set()
         self._seen: Dict[str, Set[str]] = {}
         self.request_count = 0
         self.budget_exhausted = False
+        self.cancelled = False
         self.errors: List[Dict[str, Any]] = []
+        self._errors_truncated = False
+        # Counters for things this run actually observed. Previously the
+        # file-upload total was recomputed by re-reading the whole shared
+        # pending_assets.json and counting every matching record in it — which
+        # included surfaces found by earlier runs and by other modules, so a
+        # run that discovered nothing reported three.
+        self.upload_surfaces = 0
+        self.challenge_pages = 0
+        self.captcha_widget_pages = 0
+        self.rate_limited_responses = 0
+        self.destructive_skipped = 0
+        self.truncated_pages = 0
 
     def mark_visited(self, normalized_url: str) -> bool:
         with self._lock:
@@ -1103,6 +1857,21 @@ class _CrawlState:
                 return False
             self._visited.add(normalized_url)
             return True
+
+    def unmark_visited(self, normalized_url: str) -> None:
+        """
+        Undo a reservation that never became a request.
+
+        mark_visited runs before the budget is charged, so a URL rejected by
+        the budget would otherwise stay recorded as visited and be suppressed
+        on any later, better-budgeted pass.
+        """
+        with self._lock:
+            self._visited.discard(normalized_url)
+
+    def bump(self, attribute: str, amount: int = 1) -> None:
+        with self._lock:
+            setattr(self, attribute, getattr(self, attribute) + amount)
 
     def mark_seen(self, bucket: str, key: str) -> bool:
         """Generic dedup for forms/JS refs/websocket/graphql/external-link findings."""
@@ -1123,6 +1892,16 @@ class _CrawlState:
 
     def record_error(self, stage: str, url: str, message: str) -> None:
         with self._lock:
+            if len(self.errors) >= _MAX_RECORDED_ERRORS:
+                if not self._errors_truncated:
+                    self._errors_truncated = True
+                    self.errors.append({
+                        "stage": "errors_truncated", "url": "",
+                        "error": f"error log capped at {_MAX_RECORDED_ERRORS} entries; "
+                                 f"further errors were counted but not recorded",
+                        "timestamp": _now(),
+                    })
+                return
             self.errors.append({"stage": stage, "url": url, "error": message, "timestamp": _now()})
 
 
@@ -1130,33 +1909,58 @@ class _CrawlState:
 _Task = Tuple[str, str, Optional[str]]
 
 
-def _persist_form(state: _CrawlState, form: Dict[str, Any], page_url: str) -> Dict[str, Any]:
-    """Classify + persist one form, plus its parameters and file-upload surface if applicable."""
+def _persist_form(
+    state: _CrawlState, form: Dict[str, Any], page_url: str, sink: List[Dict[str, Any]],
+    challenge: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Classify one form and append its findings to `sink` (written by the
+    caller in a single batch — see PendingAssetsStore.add_many).
+
+    `challenge` is the page's anti-bot classification, if any. A form parsed
+    out of a bot-challenge interstitial belongs to the challenge, not to the
+    target application: it is still recorded (nothing discovered is
+    discarded) but marked as such, and it never raises the HIGH-priority
+    file-upload surface, which would otherwise be a fabricated finding about
+    an application the crawler never actually reached.
+    """
     classification = classify_form(form)
     form_key = f"{form.get('method')}|{form.get('resolved_action')}|" + \
         ",".join(sorted(f.get("name") or "" for f in form.get("fields") or []))
 
+    is_challenge_artifact = bool(challenge and challenge.get("kind") == "bot_challenge")
+
     if state.mark_seen("forms", form_key):
         evidence = [f"<form method={form.get('method')} action={form.get('action')!r}> found on {page_url}"] + \
             classification["evidence"]
-        err = _safe_store_add(state.store, make_finding(
+        value = {**form, "classification": classification["category"], "not_fetched": True}
+        confidence = classification["confidence"]
+        if is_challenge_artifact:
+            value["challenge_artifact"] = True
+            value["challenge_vendors"] = challenge.get("vendors")
+            evidence.append(
+                f"Parsed from an anti-bot challenge interstitial "
+                f"({', '.join(challenge.get('vendors') or ['unidentified vendor'])}); this form belongs to "
+                f"the challenge, not to the target application"
+            )
+            # An inference about a page we were refused cannot be a
+            # high-confidence statement about the application.
+            confidence = CONFIDENCE_LOW
+        sink.append(make_finding(
             finding_type="crawled_form", target=state.target,
-            value={**form, "classification": classification["category"], "not_fetched": True},
-            evidence=evidence, confidence=classification["confidence"],
+            value=value, evidence=evidence, confidence=confidence,
             metadata={"category": classification["category"], "source_page": page_url,
-                      "method": form.get("method"), "action": form.get("resolved_action")},
+                      "method": form.get("method"), "action": form.get("resolved_action"),
+                      "challenge_artifact": is_challenge_artifact},
         ))
-        if err:
-            state.record_error("persistence", page_url, err)
 
         for param in extract_form_field_parameters(form, state.target):
-            err = _safe_store_add(state.store, make_parameter_finding(param, state.target))
-            if err:
-                state.record_error("persistence", page_url, err)
+            sink.append(make_parameter_finding(param, state.target))
 
-        if classification["category"] == "file_upload":
+        if classification["category"] == "file_upload" and not is_challenge_artifact:
             surface = build_file_upload_surface(form, classification)
-            err = _safe_store_add(state.store, make_finding(
+            state.bump("upload_surfaces")
+            sink.append(make_finding(
                 finding_type="file_upload_surface", target=state.target, value=surface,
                 evidence=classification["evidence"] + [f"Observed on page {page_url}"],
                 confidence=classification["confidence"],
@@ -1167,8 +1971,6 @@ def _persist_form(state: _CrawlState, form: Dict[str, Any], page_url: str) -> Di
                              "further action; ReconHound performs no exploitation.",
                 },
             ))
-            if err:
-                state.record_error("persistence", page_url, err)
 
     return classification
 
@@ -1177,7 +1979,17 @@ def _process_page(
     state: _CrawlState, url: str, depth: int, discovery_source: str, source_page: Optional[str],
     timeout: float, max_body_bytes: int,
 ) -> Tuple[Optional[Dict[str, Any]], List[_Task]]:
-    """Fetch one page, classify it, extract everything, persist, and report new crawl candidates."""
+    """
+    Fetch one page, classify it, extract everything, persist, and report new
+    crawl candidates.
+
+    Everything this page yields is accumulated into one `findings` list and
+    written with a single add_many() at the end. The page record is built
+    and returned whether or not that write succeeds: persistence failing must
+    never destroy an already-completed discovery (context.md §12.11), which
+    is exactly what happened when each finding was written individually and a
+    single OSError propagated out of the worker.
+    """
     resp = fetch_url(url, timeout=timeout, max_body_bytes=max_body_bytes)
     if resp["status"] != "found":
         state.record_error("fetch", url, resp.get("error") or "request failed")
@@ -1187,9 +1999,45 @@ def _process_page(
     headers = resp["headers"]
     body = resp.get("body")
     content_type = _ci_get(headers, "Content-Type")
-    path = urllib.parse.urlsplit(url).path or "/"
+    try:
+        path = urllib.parse.urlsplit(url).path or "/"
+    except ValueError:
+        path = "/"
 
+    findings: List[Dict[str, Any]] = []
     new_tasks: List[_Task] = []
+
+    if discovery_type == "rate_limited":
+        state.bump("rate_limited_responses")
+
+    # A truncated body was parsed only up to the cap, so "no links found"
+    # here means "no links in the first max_body_bytes", not "no links".
+    # Recording it keeps an incomplete parse from reading as a negative
+    # result (context.md §8).
+    body_truncated = bool(resp.get("body_truncated"))
+    if body_truncated:
+        state.bump("truncated_pages")
+        notes.append(
+            f"Response body exceeded the {max_body_bytes}-byte read cap and was truncated; "
+            f"links, forms and indicators were extracted from the retained prefix only, so "
+            f"absence of a discovery on this page is not evidence of absence"
+        )
+    if resp.get("body_read_error"):
+        notes.append(f"Response body could not be read safely: {resp['body_read_error']}")
+
+    challenge = detect_challenge_indicators(body, headers, resp.get("status_code"))
+    if challenge:
+        notes.extend(challenge["evidence"])
+        if challenge["kind"] == "bot_challenge":
+            state.bump("challenge_pages")
+            # The crawler was refused. Whatever this page contains describes
+            # the challenge, so the response must not be reported as
+            # confirmed application content.
+            if discovery_type == "content_confirmed":
+                discovery_type = "challenge_response"
+            confidence = CONFIDENCE_MEDIUM if confidence == CONFIDENCE_HIGH else confidence
+        else:
+            state.bump("captcha_widget_pages")
 
     if discovery_type == "redirect":
         location = _ci_get(headers, "Location")
@@ -1199,10 +2047,14 @@ def _process_page(
             except Exception:
                 abs_redirect = None
             if abs_redirect:
+                # Credentials in a Location header must not be re-sent or
+                # persisted, and the scope check must run on the same string
+                # the request would use.
+                abs_redirect = _strip_userinfo(abs_redirect)
                 if _candidate_in_scope(abs_redirect, state.target):
                     new_tasks.append((abs_redirect, f"redirect_from:{url}", url))
                 elif state.mark_seen("external", _normalize_url(abs_redirect)):
-                    err = _safe_store_add(state.store, make_finding(
+                    findings.append(make_finding(
                         finding_type="external_link_observed", target=state.target,
                         value={"url": abs_redirect, "referenced_from": url, "reason": "redirect_target_out_of_scope"},
                         evidence=[f"HTTP {resp['status_code']} redirect from {url} points to out-of-scope/"
@@ -1210,8 +2062,6 @@ def _process_page(
                         confidence=CONFIDENCE_HIGH,
                         metadata={"referenced_from": url, "kind": "redirect_target"},
                     ))
-                    if err:
-                        state.record_error("persistence", url, err)
 
     parameters: List[Dict[str, Any]] = []
     parameters.extend(extract_query_parameters(url, endpoint=path))
@@ -1223,71 +2073,105 @@ def _process_page(
     graphql_count = 0
 
     if _looks_textual(content_type, body):
+        # One parse for the whole page; the extractors used to build three.
+        soup = _parse_html(body)
         parameters.extend(extract_header_parameter_hints(body, headers))
 
-        forms = extract_forms(body, url)
+        forms = extract_forms(body, url, soup=soup)
+        if len(forms) > DEFAULT_MAX_FORMS_PER_PAGE:
+            state.record_error(
+                "form_cap", url,
+                f"page declared {len(forms)} forms; only the first {DEFAULT_MAX_FORMS_PER_PAGE} "
+                f"were classified and persisted (per-page cap)",
+            )
+            forms = forms[:DEFAULT_MAX_FORMS_PER_PAGE]
         form_count = len(forms)
         for form in forms:
-            _persist_form(state, form, url)
+            _persist_form(state, form, url, findings, challenge=challenge)
 
-        js_refs = extract_javascript_references(body, url, target=state.target)
+        js_refs = extract_javascript_references(
+            body, url, target=state.target, soup=soup, max_refs=DEFAULT_MAX_JS_REFS_PER_PAGE)
+        if len(js_refs) >= DEFAULT_MAX_JS_REFS_PER_PAGE:
+            state.record_error(
+                "js_ref_cap", url,
+                f"script references on this page reached the per-page cap of "
+                f"{DEFAULT_MAX_JS_REFS_PER_PAGE}; any beyond it were not recorded",
+            )
         js_ref_count = len(js_refs)
         for ref in js_refs:
             if not state.mark_seen("js", _normalize_url(ref["url"])):
                 continue
-            err = _safe_store_add(state.store, make_finding(
+            findings.append(make_finding(
                 finding_type="javascript_reference", target=state.target,
                 value={"url": ref["url"], "source_page": ref["source_page"], "in_scope": ref["in_scope"], "fetched": False},
                 evidence=ref["evidence"], confidence=CONFIDENCE_HIGH,
                 metadata={"source_page": ref["source_page"], "for_module": "js_analyzer.py"},
             ))
-            if err:
-                state.record_error("persistence", url, err)
 
         ws_indicators = detect_websocket_indicators(body, url)
+        if len(ws_indicators) > DEFAULT_MAX_WS_INDICATORS_PER_PAGE:
+            state.record_error(
+                "websocket_cap", url,
+                f"page contained {len(ws_indicators)} WebSocket URL literals; only the first "
+                f"{DEFAULT_MAX_WS_INDICATORS_PER_PAGE} were persisted (per-page cap)",
+            )
+            ws_indicators = ws_indicators[:DEFAULT_MAX_WS_INDICATORS_PER_PAGE]
         ws_count = len(ws_indicators)
         for ws in ws_indicators:
             ws_key = ws["endpoint"] or f"no_literal:{url}"
             if not state.mark_seen("websocket", ws_key):
                 continue
-            err = _safe_store_add(state.store, make_finding(
+            # A page can reference any WebSocket host it likes. Recording
+            # "wss://attacker.example/steal" against the target without
+            # saying it is off-target attributed a third party's endpoint to
+            # the scanned host.
+            ws_in_scope = _ws_endpoint_in_scope(ws["endpoint"], state.target)
+            ws_evidence = list(ws["evidence"])
+            if ws_in_scope is False:
+                ws_evidence.append(
+                    "WebSocket endpoint host is outside the crawl scope; referenced by the target "
+                    "but not part of its own attack surface"
+                )
+            findings.append(make_finding(
                 finding_type="websocket_indicator", target=state.target,
-                value={"endpoint": ws["endpoint"], "source_page": ws["source_page"]},
-                evidence=ws["evidence"], confidence=ws["confidence"],
-                metadata={"source_page": ws["source_page"]},
+                value={"endpoint": ws["endpoint"], "source_page": ws["source_page"], "in_scope": ws_in_scope},
+                evidence=ws_evidence, confidence=ws["confidence"],
+                metadata={"source_page": ws["source_page"], "in_scope": ws_in_scope},
             ))
-            if err:
-                state.record_error("persistence", url, err)
 
-        page_links = extract_page_links(body, url, target=state.target)
+        page_links = extract_page_links(
+            body, url, target=state.target, soup=soup, max_links=DEFAULT_MAX_LINKS_PER_PAGE)
+        if len(page_links) >= DEFAULT_MAX_LINKS_PER_PAGE:
+            state.record_error(
+                "link_cap", url,
+                f"links on this page reached the per-page cap of {DEFAULT_MAX_LINKS_PER_PAGE}; "
+                f"any beyond it were neither queued nor recorded",
+            )
+
         referenced_urls = [l["url"] for l in page_links] + [r["url"] for r in js_refs]
         graphql_indicators = detect_graphql_indicators(body, url, headers=headers, referenced_urls=referenced_urls)
         graphql_count = len(graphql_indicators)
         for gi in graphql_indicators:
             if not state.mark_seen("graphql", f"{gi['indicator_type']}:{gi['value']}"):
                 continue
-            err = _safe_store_add(state.store, make_finding(
+            findings.append(make_finding(
                 finding_type="graphql_indicator", target=state.target,
                 value={"indicator_type": gi["indicator_type"], "value": gi["value"], "source_page": gi["source_page"]},
                 evidence=gi["evidence"], confidence=gi["confidence"],
                 metadata={"source_page": gi["source_page"]},
             ))
-            if err:
-                state.record_error("persistence", url, err)
 
         for link in page_links:
             if link["in_scope"]:
                 new_tasks.append((link["url"], f"{link['tag']}:{url}", url))
             elif state.mark_seen("external", _normalize_url(link["url"])):
-                err = _safe_store_add(state.store, make_finding(
+                findings.append(make_finding(
                     finding_type="external_link_observed", target=state.target,
                     value={"url": link["url"], "referenced_from": url, "tag": link["tag"]},
                     evidence=[f"{link['tag']} on {url} references out-of-scope/disallowed URL {link['url']}; not crawled"],
                     confidence=CONFIDENCE_MEDIUM,
                     metadata={"referenced_from": url, "kind": "page_link"},
                 ))
-                if err:
-                    state.record_error("persistence", url, err)
 
     deduped_params: List[Dict[str, Any]] = []
     seen_param_keys = set()
@@ -1297,9 +2181,15 @@ def _process_page(
             continue
         seen_param_keys.add(key)
         deduped_params.append(p)
-        err = _safe_store_add(state.store, make_parameter_finding(p, state.target))
-        if err:
-            state.record_error("persistence", url, err)
+        if len(deduped_params) > DEFAULT_MAX_PARAMS_PER_PAGE:
+            state.record_error(
+                "parameter_cap", url,
+                f"page yielded more than {DEFAULT_MAX_PARAMS_PER_PAGE} distinct parameters; "
+                f"the remainder were not persisted (per-page cap)",
+            )
+            deduped_params = deduped_params[:DEFAULT_MAX_PARAMS_PER_PAGE]
+            break
+        findings.append(make_parameter_finding(p, state.target))
 
     record: Dict[str, Any] = {
         "target": state.target,
@@ -1313,7 +2203,11 @@ def _process_page(
         "discovery_source": discovery_source,
         "source_page": source_page,
         "depth": depth,
-        "redirect_location": _ci_get(headers, "Location") if discovery_type == "redirect" else None,
+        # Credential-stripped: a Location header can carry "user:pass@host",
+        # and this field is persisted and rendered in the report appendix.
+        "redirect_location": (
+            _strip_userinfo(_ci_get(headers, "Location") or "") or None
+        ) if discovery_type == "redirect" else None,
         "confidence": confidence,
         "evidence": [f"GET {url} returned HTTP {resp['status_code']}"] + notes,
         "parameters": deduped_params,
@@ -1321,16 +2215,28 @@ def _process_page(
         "javascript_reference_count": js_ref_count,
         "websocket_indicator_count": ws_count,
         "graphql_indicator_count": graphql_count,
+        "body_truncated": body_truncated,
+        "content_complete": not body_truncated and not resp.get("body_read_error"),
+        "challenge": {
+            "kind": challenge["kind"], "vendors": challenge["vendors"],
+            "confidence": challenge["confidence"],
+        } if challenge else None,
         "timestamp": _now(),
     }
-    err = _safe_store_add(state.store, make_finding(
+    findings.append(make_finding(
         finding_type="crawled_url", target=state.target, value=dict(record),
         evidence=record["evidence"], confidence=confidence,
         metadata={
             "discovery_source": discovery_source, "source_page": source_page,
             "depth": depth, "discovery_type": discovery_type, "url": url,
+            "challenge_kind": challenge["kind"] if challenge else None,
+            "content_complete": record["content_complete"],
         },
     ))
+
+    # One write for the whole page. A failure is recorded but never discards
+    # the record: the caller still receives everything discovered here.
+    err = _safe_store_add_many(state.store, findings)
     if err:
         state.record_error("persistence", url, err)
 
@@ -1342,8 +2248,11 @@ def _run_crawl_batch(
 ) -> List[Tuple[Optional[Dict[str, Any]], List[_Task]]]:
     """Run one depth-level of tasks concurrently, respecting the visited-set and request budget."""
     results: List[Tuple[Optional[Dict[str, Any]], List[_Task]]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-        future_map = {}
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_workers))
+    future_map: Dict[Any, str] = {}
+    harvested: Set[Any] = set()
+    skip_findings: List[Dict[str, Any]] = []
+    try:
         for url, discovery_source, source_page in tasks:
             # The seed task was already validated by validate_crawl_target() in
             # run_crawler() — an operator-authorized base_url/target must never be
@@ -1354,29 +2263,94 @@ def _run_crawl_batch(
             # runner must not be able to bypass scope enforcement.
             if discovery_source != "seed" and not _candidate_in_scope(url, state.target):
                 if state.mark_seen("external", _normalize_url(url)):
-                    err = _safe_store_add(state.store, make_finding(
+                    skip_findings.append(make_finding(
                         finding_type="external_link_observed", target=state.target,
                         value={"url": url, "referenced_from": source_page, "reason": "out_of_scope_candidate"},
                         evidence=[f"Candidate URL {url} rejected by scope enforcement (source: {discovery_source})"],
                         confidence=CONFIDENCE_HIGH,
                         metadata={"referenced_from": source_page, "kind": "rejected_candidate"},
                     ))
-                    if err:
-                        state.record_error("persistence", url, err)
                 continue
-            if not state.mark_visited(_normalize_url(url)):
+
+            # Opt-in request safety: with avoid_destructive enabled, a
+            # discovered URL that names a state-changing action is recorded
+            # as surface and never requested. An operator-supplied seed is
+            # exempt — naming it as the crawl root IS the authorisation, the
+            # same distinction validate_crawl_target draws against
+            # _candidate_in_scope.
+            normalized = _normalize_url(url)
+            if state.avoid_destructive and discovery_source != "seed":
+                destructive = classify_destructive_candidate(url)
+                if destructive is not None:
+                    if state.mark_visited(normalized):
+                        state.bump("destructive_skipped")
+                        skip_findings.append(make_finding(
+                            finding_type="crawled_url", target=state.target,
+                            value={
+                                "target": state.target, "url": url, "normalized_url": normalized,
+                                "path": urllib.parse.urlsplit(url).path or "/", "method": "GET",
+                                "status_code": None, "discovery_type": "not_fetched",
+                                "discovery_source": discovery_source, "source_page": source_page,
+                                "depth": depth, "fetched": False,
+                                "skip_reason": destructive["reason"],
+                                "skip_match": destructive["matched"],
+                                "content_complete": False,
+                            },
+                            evidence=destructive["evidence"] + [
+                                f"Discovered as {discovery_source} on {source_page}",
+                            ],
+                            confidence=destructive["confidence"],
+                            metadata={
+                                "discovery_source": discovery_source, "source_page": source_page,
+                                "depth": depth, "discovery_type": "not_fetched", "url": url,
+                                "skip_reason": destructive["reason"],
+                            },
+                        ))
+                    continue
+
+            if not state.mark_visited(normalized):
                 continue
             if not state.reserve_request():
+                # Never requested, so it must not stay recorded as visited.
+                state.unmark_visited(normalized)
                 break
             future_map[executor.submit(
                 _process_page, state, url, depth, discovery_source, source_page, timeout, max_body_bytes,
             )] = url
         for future in concurrent.futures.as_completed(future_map):
             url = future_map[future]
+            harvested.add(future)
             try:
                 results.append(future.result())
             except Exception as exc:  # a single bad task must not abort the batch
                 state.record_error("probe", url, str(exc))
+    except KeyboardInterrupt:
+        state.cancelled = True
+        state.record_error("cancelled", "", "interrupted by user; partial results retained")
+        for future in future_map:
+            future.cancel()
+        # Harvest whatever already finished; nothing discovered is thrown
+        # away. `except BaseException` is required, not defensive over-reach:
+        # an interrupt delivered inside a worker is stored on that worker's
+        # future, so result() re-raises KeyboardInterrupt here too — catching
+        # only Exception would let it escape the recovery path and lose the
+        # very partial results this block exists to preserve.
+        for future, url in future_map.items():
+            if future in harvested or not future.done() or future.cancelled():
+                continue
+            harvested.add(future)
+            try:
+                results.append(future.result())
+            except BaseException:
+                continue
+    finally:
+        try:
+            executor.shutdown(wait=not state.cancelled, cancel_futures=True)
+        except TypeError:  # pragma: no cover - Python < 3.9
+            executor.shutdown(wait=not state.cancelled)
+    err = _safe_store_add_many(state.store, skip_findings)
+    if err:
+        state.record_error("persistence", "", err)
     return results
 
 
@@ -1393,6 +2367,7 @@ def run_crawler(
     max_pages: int = DEFAULT_MAX_PAGES,
     max_workers: int = DEFAULT_MAX_WORKERS,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    avoid_destructive: bool = False,
 ) -> Dict[str, Any]:
     """
     Recursively crawl `base_url` within scope and persist every completed
@@ -1401,12 +2376,26 @@ def run_crawler(
 
     A failure fetching one page (network error, malformed response) does
     not stop the rest of the crawl — see summary["errors"].
+
+    COMPLETENESS. The summary distinguishes a crawl that finished from one
+    that was cut short, because downstream reads an empty result as evidence:
+    `depth_truncated` (candidates existed at the depth limit and were never
+    explored), `request_budget_exhausted`, `cancelled`, and `status`
+    ("completed" / "completed_with_errors" / "interrupted"). A partial crawl
+    must never report itself as a complete one.
+
+    `avoid_destructive` (default False) is an opt-in safety mode. When
+    enabled it keeps the crawler from *requesting* discovered URLs that name
+    a state-changing action; they are still recorded as discovered surface,
+    marked as never fetched. The default preserves the crawler's normal
+    reach and every pre-existing caller's behaviour. The operator-supplied
+    `base_url` is never suppressed by it.
     """
     base_url = validate_crawl_target(base_url, target=target)
     target = target or (urllib.parse.urlsplit(base_url).hostname or base_url)
 
     store = PendingAssetsStore(output_dir=output_dir)
-    state = _CrawlState(target, store, max_pages, max_depth)
+    state = _CrawlState(target, store, max_pages, max_depth, avoid_destructive=avoid_destructive)
 
     summary: Dict[str, Any] = {
         "target": target,
@@ -1422,41 +2411,108 @@ def run_crawler(
         "file_upload_surfaces_discovered": 0,
         "external_links_observed": 0,
         "requests_made": 0,
+        "max_depth": max_depth,
         "max_depth_reached": False,
+        "depth_truncated": False,
         "request_budget_exhausted": False,
+        "cancelled": False,
+        "rate_limited": False,
+        "challenge_pages": 0,
+        "captcha_widget_pages": 0,
+        "truncated_pages": 0,
+        "destructive_endpoints_skipped": 0,
+        "crawl_complete": False,
         "errors": [],
     }
 
     depth = 0
     frontier: List[_Task] = [(base_url, "seed", None)]
-    while frontier and depth <= max_depth and not state.budget_exhausted:
+    while frontier and depth <= max_depth and not state.budget_exhausted and not state.cancelled:
         results = _run_crawl_batch(state, frontier, depth, timeout, max_body_bytes, max_workers)
         next_frontier: List[_Task] = []
+        queued_raw: Set[str] = set()
+        pending_beyond_depth = False
         for record, new_candidates in results:
             if record is not None:
                 summary["pages"].append(record)
                 summary["parameters"].extend(record["parameters"])
             if depth < max_depth:
-                next_frontier.extend(new_candidates)
+                # Deduplicate as the frontier is built. Previously every page
+                # appended every one of its links, so a 600-link page at 60
+                # pages queued 36,000 tuples for a 60-request budget; a
+                # duplicate-heavy site grew the frontier without bound.
+                for candidate in new_candidates:
+                    key = _normalize_url(candidate[0])
+                    if key in queued_raw:
+                        continue
+                    queued_raw.add(key)
+                    next_frontier.append(candidate)
+            elif new_candidates:
+                pending_beyond_depth = True
+        # next_frontier is built before its requests are spent, so a wide
+        # level can allocate far more task tuples than the run could ever
+        # fetch. Truncating at the cap bounds memory without changing which
+        # candidates are reachable within the request budget.
+        if len(next_frontier) > DEFAULT_MAX_FRONTIER:
+            state.record_error(
+                "frontier_cap", "",
+                f"depth {depth} produced {len(next_frontier)} candidates; truncated to "
+                f"{DEFAULT_MAX_FRONTIER} (frontier cap)",
+            )
+            next_frontier = next_frontier[:DEFAULT_MAX_FRONTIER]
+        # Candidates that exist but were never explored because the depth
+        # limit stopped the descent — this is what `depth_truncated` reports.
+        if pending_beyond_depth:
+            summary["depth_truncated"] = True
         depth += 1
         frontier = next_frontier
 
-    if frontier and not state.budget_exhausted:
-        summary["max_depth_reached"] = True
+    # `max_depth_reached` means the loop actually ran the deepest permitted
+    # level. The previous formulation ("frontier left over at the end") could
+    # never be true, because the level at max_depth deliberately queues no
+    # successors — so the flag reported False on every run that truncated,
+    # exactly the case it existed to signal. `depth_truncated` is the separate
+    # question of whether unexplored candidates were left behind.
+    summary["max_depth_reached"] = depth > max_depth
+    if frontier and state.budget_exhausted:
+        summary["depth_truncated"] = True
     summary["request_budget_exhausted"] = state.budget_exhausted
+    summary["cancelled"] = state.cancelled
     summary["requests_made"] = state.request_count
     summary["forms_discovered"] = len(state._seen.get("forms", set()))
     summary["javascript_references_discovered"] = len(state._seen.get("js", set()))
     summary["websocket_indicators_discovered"] = len(state._seen.get("websocket", set()))
     summary["graphql_indicators_discovered"] = len(state._seen.get("graphql", set()))
     summary["external_links_observed"] = len(state._seen.get("external", set()))
-    summary["file_upload_surfaces_discovered"] = sum(
-        1 for f in store.all()
-        if f.get("type") == "file_upload_surface" and f.get("target") == target
-    ) if store is not None else 0
+    # Counted from what this run actually discovered. Re-reading the shared
+    # pending_assets.json and counting every matching record in it also
+    # counted earlier runs' and other modules' surfaces, so a run that found
+    # none could report three.
+    summary["file_upload_surfaces_discovered"] = state.upload_surfaces
+    summary["challenge_pages"] = state.challenge_pages
+    summary["captcha_widget_pages"] = state.captcha_widget_pages
+    summary["truncated_pages"] = state.truncated_pages
+    summary["destructive_endpoints_skipped"] = state.destructive_skipped
+    summary["rate_limited"] = state.rate_limited_responses > 0
+
+    # The single flag downstream can trust for "this crawl saw the whole
+    # reachable surface it was asked to". Anything that cut the walk short —
+    # the depth limit, the request budget, an interrupt, a rate limit, an
+    # anti-bot challenge, or a body too large to parse in full — makes an
+    # empty result inconclusive rather than negative (context.md §8).
+    summary["crawl_complete"] = not (
+        summary["depth_truncated"] or summary["request_budget_exhausted"]
+        or summary["cancelled"] or summary["rate_limited"]
+        or summary["challenge_pages"] or summary["truncated_pages"]
+    )
 
     summary["errors"] = state.errors
-    summary["status"] = "completed_with_errors" if summary["errors"] else "completed"
+    if state.cancelled:
+        summary["status"] = "interrupted"
+    elif summary["errors"]:
+        summary["status"] = "completed_with_errors"
+    else:
+        summary["status"] = "completed"
     summary["finished_at"] = _now()
     return summary
 
@@ -1478,12 +2534,19 @@ def _main() -> None:
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH, help="Recursion depth limit")
     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="Total page-fetch budget")
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Concurrent worker threads")
+    parser.add_argument(
+        "--avoid-destructive-endpoints", action="store_true",
+        help="Do not request discovered URLs that name a state-changing action "
+             "(logout, delete, ...); record them as surface with fetched=false instead. "
+             "Off by default, preserving the crawler's normal reach.",
+    )
     args = parser.parse_args()
 
     try:
         result = run_crawler(
             args.url, target=args.target, output_dir=args.output_dir, timeout=args.timeout,
             max_depth=args.max_depth, max_pages=args.max_pages, max_workers=args.max_workers,
+            avoid_destructive=args.avoid_destructive_endpoints,
         )
     except ScopeError as exc:
         print(f"[scope error] {exc}")
