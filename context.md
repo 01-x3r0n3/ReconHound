@@ -22,7 +22,7 @@ work on this repository. Read it before implementing any module.
 
 - The architecture in the spec is **locked by default**.
 - Do not silently redesign, remove, merge, or replace architectural
-  components (the 23 modules, the asset graph, evidence/confidence model,
+  components (the 22 modules, the asset graph, evidence/confidence model,
   etc.).
 - May raise technical problems, contradictions, security concerns, or
   improvement ideas — but must **stop and explain** proposed architectural
@@ -61,7 +61,9 @@ points, object IDs) — it never exploits it.
   indicators, tables.
 - Core libs: `dnspython`, `python-whois`, `requests`, `rich`, `argparse`,
   `socket`, `ssl`, `threading`, `asyncio`, `beautifulsoup4`, `re`, `json`.
-- Output formats: JSON (machine-readable) and HTML (professional report).
+- Output formats: the terminal report (primary, Rich-based; also written as
+  plain text), JSON (machine-readable) and HTML (secondary/compatibility) —
+  see §18.2.
 
 ## 6. Core architectural philosophy
 
@@ -141,7 +143,7 @@ resolution of a fingerprint conflict.
   MEDIUM/LOW signals converging on one asset can combine into CRITICAL;
   the engine must explain *why* a score was produced.
 
-## 10. The 23 modules
+## 10. The modules (22; numbered 1-23, item 18 removed — §18.1)
 
 Format: `name.py` — Phase — Purpose — key responsibilities — output feeds.
 
@@ -162,10 +164,11 @@ Format: `name.py` — Phase — Purpose — key responsibilities — output feed
 15. **exposure_scan.py** — Active — Sensitive resource/info exposure. Exposed `.git`, `.env`, backups, archives, DB dumps, config files, debug pages, admin panels, `robots.txt`, `sitemap.xml`, cloud misconfig (S3/GCS/Azure Blob) incl. authorized live listability checks, error-page intel (stack traces, framework versions, internal paths), per-endpoint HTTP OPTIONS discovery. → `surface_mapper.py`
 16. **http_analyzer.py** — Active — HTTP security posture. Security headers (CSP/HSTS/X-Frame-Options/X-Content-Type-Options/Referrer-Policy/Permissions-Policy), cookie flags (HttpOnly/Secure/SameSite), CORS (origin reflection/null origin/wildcards), auth surfaces (login/logout/password-reset/OAuth/SSO/MFA indicators), JWT detection + algorithm inspection (no exploitation), cache intelligence, host-header behavior, redirect-chain mapping, WAF signal detection. → `surface_mapper.py`
 17. **ssl_analyzer.py** — Active — TLS/cert intelligence. Cert validity/expiration, TLS version detection (flag TLS 1.0/1.1 as outdated), cipher-suite analysis, hostname validation, SAN extraction (feeds new hostnames back to surface_mapper), cert-chain analysis, self-signed detection. → `surface_mapper.py`
-18. **screenshot.py** — Active — Visual asset triage. Screenshots of discovered web interfaces organized by subdomain; enables rapid visual identification of login pages/admin panels/default pages.
+18. ~~**screenshot.py**~~ — **removed** (see §18.1). The number is retained so the
+    remaining modules keep the identifiers the codebase cites as "§10 item N".
 19. **vuln_intel.py** — Intelligence — Technology-to-CVE mapping. Consumes versions from tech_fingerprint.py and active_recon.py, queries NVD + public vuln DBs, maps versions to known CVEs. Output style: "Detected Nginx 1.18.0 — MAY be affected by CVE-XXXX." **Never claim "confirmed exploitable" without actual evidence.** Detection ≠ confirmed vulnerability. → `risk_engine.py`
 20. **risk_engine.py** — Intelligence — Relationship-based prioritization. Scores CRITICAL/HIGH/MEDIUM/LOW/INFO, consumes the asset graph + relationships (not isolated findings), cross-module correlation (e.g. 6 converging signals on one asset, deprecated API + leaked cred in code_leak, missing HSTS + self-signed cert + outdated TLS → combined higher severity). Produces prioritized investigation queue with explanation per score. Severity guide: CRITICAL = exposed creds, listable buckets, RCE-class CVEs, IPMI exposure, exposed DB ports; HIGH = admin panels, major misconfig, deprecated APIs w/ known CVEs; MEDIUM = missing security headers, outdated TLS, SNMP defaults; LOW = minor informational; INFO = technology observations. Severity is a prioritization assessment, not proof of exploitability.
-21. **report_generator.py** — Output — Professional reporting. HTML report: executive summary, target asset inventory, technology stack, attack-surface paths, risk-ranked findings (CRITICAL first) with evidence, supply-chain dependency map, vuln intel section, raw-data appendix. Also machine-readable JSON export.
+21. **report_generator.py** — Output — Professional reporting. Terminal-first (§18.2): a Rich-based terminal report printed at the end of every CLI run and written as plain text — executive summary, investigation queue, risk-ranked findings (CRITICAL first) with evidence and provenance, vuln intel section, attack-surface paths, technology stack, services, endpoints/JavaScript/supply-chain listings, conflicts, negative results, limitations. Also machine-readable JSON export, and an HTML report retained as a secondary/compatibility format (same sections plus the raw-data appendix).
 22. **core/orchestrator.py** — Core — Adaptive execution coordination. Controls full execution flow across phases, implements decision queue w/ justification, routes data between modules via surface_mapper.py, reacts to surface_mapper triggers (new discovery → schedule next action), coordinates threading/async, rate limiting, delay management, resume capability, graceful per-module failure isolation. Execution modes: `--full-scan`, `--passive-only`, `--active-only`, `--module [name]`.
 23. **reconhound.py** — Entry point — CLI. ASCII banner, Rich terminal output, colored/professional output, progress indicators, argparse handling, starts orchestrator with parsed args, graceful keyboard-interrupt with save-before-exit.
 
@@ -174,7 +177,7 @@ CLI usage examples:
 reconhound --target example.com --full-scan
 reconhound --target example.com --passive-only
 reconhound --target example.com --module js_analyzer
-reconhound --target example.com --output /reports/report.html
+reconhound --target example.com --output-dir /reports/example
 reconhound --target example.com --threads 10 --timeout 30
 ```
 
@@ -202,7 +205,6 @@ reconhound/
 ├── exposure_scan.py
 ├── http_analyzer.py
 ├── ssl_analyzer.py
-├── screenshot.py
 ├── vuln_intel.py
 ├── risk_engine.py
 ├── report_generator.py
@@ -286,7 +288,7 @@ Build and test **one module at a time**, in this order:
 16. `code_leak.py`
 17. `tech_fingerprint.py`
 18. `js_analyzer.py`
-19. `screenshot.py`
+19. ~~`screenshot.py`~~ — removed (see §18.1); position retained.
 20. `osint_engine.py`
 21. `api_recon.py`
 22. `vhost_scanner.py`
@@ -301,7 +303,7 @@ that can be built/tested independently of those credentials.
 ## 14. Current status
 
 - Architecture: complete and **locked** (changes require explicit approval).
-- Module count: 23.
+- Module count: 22 (see §18).
 - Implementation: **not started**.
 - **Current implementation target: `passive_recon.py`.**
 
@@ -350,4 +352,73 @@ DISCOVER → NORMALIZE → STORE EVIDENCE → UPDATE ASSET GRAPH → CORRELATE
 → DISCOVER AGAIN → PRIORITIZE → REPORT
 ```
 
-This loop must be preserved throughout all 23 modules.
+This loop must be preserved throughout all 22 modules.
+
+## 18. Approved architecture amendments
+
+Amendments to the otherwise-locked architecture of §2, recorded here so the
+module list above stays the single source of truth.
+
+### 18.1 — `screenshot.py` removed (2026-09-08, approved)
+
+**Was:** module 18, "Active — Visual asset triage. Screenshots of discovered
+web interfaces organized by subdomain; enables rapid visual identification of
+login pages/admin panels/default pages."
+
+**Removed because** a repository-level audit established that the module
+produced no reconnaissance intelligence that existed only because it ran:
+
+- Its only unique artifact was a PNG on disk. `report_generator.py` never
+  referenced it, `risk_engine.py` scored its findings as
+  `unclassified:screenshot_captured` INFO, and its observations consumed
+  slots in the report's bounded raw-data appendix. With reporting being
+  terminal-oriented, nothing consumes an image at all.
+- It never read anything back out of the browser (no DOM dump, no console,
+  no network capture, no client-side redirect resolution). Every field it
+  persisted — status code, page title, triage classification — came from one
+  plain `requests` GET, not from rendering.
+- Its login/admin/default-page classification duplicated, more weakly,
+  `http_analyzer.py`'s auth-surface detection and `exposure_scan.py`'s
+  administrative-panel detection, both of which already carry evidence,
+  confidence and risk rules.
+
+**Deferred, not lost (future/v2):** genuine headless-browser reconnaissance —
+rendered-DOM route discovery, JS-driven redirect resolution, browser-observed
+XHR/WebSocket traffic — is a real capability gap that this module never
+filled. If it is ever built, it belongs in a browser-rendering module feeding
+`crawler.py`/`js_analyzer.py`'s existing contracts, not in a screenshot
+module. Default/placeholder-install-page identification, if wanted, belongs
+to `tech_fingerprint.py`.
+
+### 18.2 — Reporting is terminal-first; HTML is secondary (2026-09-11, approved)
+
+**Was:** §5 and §10 item 21 named "JSON (machine-readable) and HTML
+(professional report)" as the output formats, with the HTML report as the
+operator-facing artifact.
+
+**Now:** `report_generator.py` builds one report document from the graph,
+the assessment and the execution record and renders it three ways:
+
+- **Terminal report (primary human report).** Rich-based, WinPEAS/LinPEAS-
+  inspired in structure (summary panel, ruled sections, one block per
+  finding), ReconHound-native in content. `reconhound.py` prints it after
+  every run, between its own run summary and the artifact table, from the
+  same document that was persisted; the CLI's earlier risk panel is shown
+  only when no report could be generated. Severity, confidence and evidence
+  class are textual badges (`[CRIT][HIGH CONF][CONFIRMED]`); colour only
+  decorates them. The same rendering is written as
+  `output/reports/reconhound_report.txt` (no ANSI).
+- **JSON report** (`reconhound_report.json`) — machine-readable, schema 1.1,
+  additive over 1.0. It carries the hardened (sanitized, redacted, bounded)
+  form of every value, so automation sees exactly what the terminal shows.
+- **HTML report** (`reconhound_report.html`) — retained as a
+  secondary/compatibility format. A repository audit found no runtime
+  consumer: no module reads it and the CLI only lists its path. It is used
+  as a rendered-output oracle by tests in five modules and named in the
+  README's artifact table, so removing it would break those contracts for
+  no reconnaissance benefit. It is still written by default, its content
+  contract is unchanged, and it must never dictate the terminal design.
+
+**Why terminal-first:** the operator is at a terminal; the report is read
+where the run happened, pipes and CI logs get the same plain text, and
+nothing depends on a browser or an image (§18.1).

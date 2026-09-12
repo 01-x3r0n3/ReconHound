@@ -49,16 +49,16 @@ precedent).
 
 BUILD-ORDER NOTE: context.md §13 lists this module at build-order position
 20, after surface_mapper.py (position 8) and after passive_intel.py (15),
-code_leak.py (16), tech_fingerprint.py (17), js_analyzer.py (18) and
-screenshot.py (19) — all of which already exist in this repository except
-surface_mapper.py. Per those modules' docstrings, this repository is
-already operating under an explicit, user-approved deviation from the
-surface_mapper-first ordering — surface_mapper.py has not been implemented
-yet. This module continues under the same deviation, for the same reason:
-it is implemented as a fully standalone producer that does not implement,
-replace, or depend on surface_mapper.py's correlation engine, and does not
-touch any other unimplemented module (risk_engine.py, core/orchestrator.py,
-reconhound.py, vhost_scanner.py, api_recon.py, supply_chain.py).
+code_leak.py (16), tech_fingerprint.py (17) and js_analyzer.py (18) — all
+of which already exist in this repository except surface_mapper.py. Per
+those modules' docstrings, this repository is already operating under an
+explicit, user-approved deviation from the surface_mapper-first ordering —
+surface_mapper.py has not been implemented yet. This module continues under
+the same deviation, for the same reason: it is implemented as a fully
+standalone producer that does not implement, replace, or depend on
+surface_mapper.py's correlation engine, and does not touch any other
+unimplemented module (risk_engine.py, core/orchestrator.py, reconhound.py,
+vhost_scanner.py, api_recon.py, supply_chain.py).
 
 PASSIVE BOUNDARY: this module's only network interactions are with public,
 third-party intelligence services — crt.sh (Certificate Transparency log
@@ -284,7 +284,7 @@ every other implemented module, sharing the same output file). Output is
 intended to feed surface_mapper.py (module 6, not yet implemented) — this
 module does not implement or call into surface_mapper, active_recon,
 tech_fingerprint, vhost_scanner, api_recon, js_analyzer, supply_chain,
-http_analyzer, ssl_analyzer, screenshot, vuln_intel, risk_engine,
+http_analyzer, ssl_analyzer, vuln_intel, risk_engine,
 report_generator, orchestrator, or any other module not already
 implemented.
 

@@ -1156,6 +1156,145 @@ class TestAttackSurfacePathTruncation:
         assert truncated[0]["truncated"] is True
 
 
+# ---------------------------------------------------------------------------
+# Conflict kinds
+#
+# Reproduces the correctness defect found in the 2026-09-12 whole-system
+# audit: every repeat scan of a live target accumulated permanent
+# "contradictions between modules" for attributes that had simply changed —
+# a bumped DNS SOA serial, a refreshed WHOIS record, a rotated A record, an
+# upgraded nginx — all of them recorded by one module at two different times.
+# The report described all seven of a real run's conflicts as contradictions
+# between modules (none of them was), and risk_engine.py suspended every CVE
+# for a technology whose version had changed since the previous run.
+# ---------------------------------------------------------------------------
+
+
+class TestConflictKinds:
+    def _version(self, mapper, value, source, when):
+        mapper.ingest_finding(finding(
+            "tech_fingerprint_detected",
+            {"technology": "Nginx", "category": "server", "version": value,
+             "url": "https://example.com/"},
+            source=source, timestamp=when))
+
+    def _conflict(self, mapper):
+        tech_id = sm._aid(sm.ASSET_TECHNOLOGY, sm._norm_url("https://example.com/"), "nginx")
+        conflicts = mapper.get_conflicts(tech_id)
+        assert len(conflicts) == 1
+        return conflicts[0]
+
+    def test_one_module_observing_a_change_over_time_is_temporal(self, mapper):
+        self._version(mapper, "1.18.0", "tech_fingerprint.py", "2026-01-01T00:00:00+00:00")
+        self._version(mapper, "1.20.1", "tech_fingerprint.py", "2026-02-01T00:00:00+00:00")
+        conflict = self._conflict(mapper)
+        assert conflict["kind"] == sm.CONFLICT_TEMPORAL
+        assert conflict["sources"] == ["tech_fingerprint.py"]
+
+    def test_two_modules_disagreeing_is_cross_source(self, mapper):
+        self._version(mapper, "1.18.0", "tech_fingerprint.py", "2026-02-01T00:00:00+00:00")
+        self._version(mapper, "1.20.1", "active_recon.py", "2026-02-01T00:05:00+00:00")
+        conflict = self._conflict(mapper)
+        assert conflict["kind"] == sm.CONFLICT_CROSS_SOURCE
+        assert conflict["sources"] == ["active_recon.py", "tech_fingerprint.py"]
+
+    def test_a_temporal_conflict_is_promoted_when_a_second_module_disagrees(self, mapper):
+        self._version(mapper, "1.18.0", "tech_fingerprint.py", "2026-01-01T00:00:00+00:00")
+        self._version(mapper, "1.20.1", "tech_fingerprint.py", "2026-02-01T00:00:00+00:00")
+        assert self._conflict(mapper)["kind"] == sm.CONFLICT_TEMPORAL
+        self._version(mapper, "1.25.3", "active_recon.py", "2026-02-01T00:05:00+00:00")
+        assert self._conflict(mapper)["kind"] == sm.CONFLICT_CROSS_SOURCE
+
+    def test_cross_source_is_never_demoted_back_to_temporal(self, mapper):
+        self._version(mapper, "1.18.0", "tech_fingerprint.py", "2026-01-01T00:00:00+00:00")
+        self._version(mapper, "1.20.1", "active_recon.py", "2026-01-02T00:00:00+00:00")
+        assert self._conflict(mapper)["kind"] == sm.CONFLICT_CROSS_SOURCE
+        for i in range(5):
+            self._version(mapper, f"1.3{i}.0", "tech_fingerprint.py",
+                          f"2026-03-0{i + 1}T00:00:00+00:00")
+        assert self._conflict(mapper)["kind"] == sm.CONFLICT_CROSS_SOURCE
+
+    def test_the_source_set_survives_observation_truncation(self, mapper):
+        # The observation list is capped at 50; the sources it proves must not
+        # be lost with the entries that get dropped, or a cross-source
+        # conflict would silently become a temporal one on a flapping value.
+        self._version(mapper, "1.18.0", "tech_fingerprint.py", "2026-01-01T00:00:00+00:00")
+        self._version(mapper, "1.20.1", "active_recon.py", "2026-01-02T00:00:00+00:00")
+        for i in range(80):
+            self._version(mapper, f"9.{i}.0", "tech_fingerprint.py",
+                          f"2026-04-01T00:{i:02d}:00+00:00")
+        conflict = self._conflict(mapper)
+        assert conflict["truncated"] is True
+        assert conflict["kind"] == sm.CONFLICT_CROSS_SOURCE
+        assert "active_recon.py" in conflict["sources"]
+
+    def test_both_kinds_still_preserve_every_value(self, mapper):
+        # Classification changes how a conflict is described, never whether
+        # it is kept (design principle 7).
+        self._version(mapper, "1.18.0", "tech_fingerprint.py", "2026-01-01T00:00:00+00:00")
+        self._version(mapper, "1.20.1", "tech_fingerprint.py", "2026-02-01T00:00:00+00:00")
+        conflict = self._conflict(mapper)
+        assert {o["value"] for o in conflict["observations"]} == {"1.18.0", "1.20.1"}
+        assert conflict["status"] == "unresolved"
+
+    def test_active_recon_service_disagreement_is_cross_source(self, mapper):
+        # Two detection methods inside one module disagreeing is a genuine
+        # contradiction, not a change over time.
+        mapper.ingest_finding(finding(
+            "service_conflict",
+            {"ip": "5.6.7.8", "port": 8080, "protocol": "tcp", "service": None,
+             "port_guess": "http-alt", "banner_guess": "ssh"},
+            source="active_recon.py"))
+        port_id = sm._aid(sm.ASSET_PORT, "5.6.7.8", 8080, "tcp")
+        assert mapper.get_conflicts(port_id)[0]["kind"] == sm.CONFLICT_CROSS_SOURCE
+
+
 if __name__ == "__main__":
     import subprocess
     subprocess.run([sys.executable, "-m", "pytest", __file__, "-v"])
+
+
+class TestSelfReferentialRelationships:
+    """
+    2026-09-12 whole-system audit: every leaf certificate lists its own
+    subject among its SANs, so every run produced
+    `rel:certificate_san:hostname:example.com->hostname:example.com` — a
+    one-node cycle in the asset graph, a meaningless row in the report's
+    relationship inventory, and a "discovery chain" that explains a host by
+    itself.
+    """
+
+    def test_a_cert_san_naming_its_own_subject_creates_no_relationship(self, mapper):
+        mapper.ingest_finding(finding("tls_san", TARGET, target=TARGET,
+                                      source="ssl_analyzer.py"))
+        self_edges = [r for r in mapper.state["relationships"].values()
+                      if r["from_asset"] == r["to_asset"]]
+        assert self_edges == []
+
+    def test_the_observation_and_its_evidence_are_still_recorded(self, mapper):
+        mapper.ingest_finding(finding("tls_san", TARGET, target=TARGET,
+                                      source="ssl_analyzer.py"))
+        sans = [o for o in mapper.state["observations"].values() if o["type"] == "tls_san"]
+        assert len(sans) == 1 and sans[0]["value"] == TARGET
+
+    def test_a_san_naming_a_different_host_still_creates_the_relationship(self, mapper):
+        mapper.ingest_finding(finding("tls_san", f"api.{TARGET}", target=TARGET,
+                                      source="ssl_analyzer.py"))
+        edges = [r for r in mapper.state["relationships"].values()
+                 if r["rel_type"] == sm.REL_CERTIFICATE_SAN]
+        assert len(edges) == 1
+        assert edges[0]["from_asset"] != edges[0]["to_asset"]
+
+    def test_the_graph_has_no_cycles_after_a_self_naming_san(self, mapper):
+        mapper.ingest_finding(finding("tls_san", TARGET, target=TARGET, source="ssl_analyzer.py"))
+        mapper.ingest_finding(finding("tls_san", f"api.{TARGET}", target=TARGET, source="ssl_analyzer.py"))
+        mapper.ingest_finding(finding("dns_record",
+                                      {"record_type": "A", "records": ["203.0.113.1"]},
+                                      source="passive_recon.py"))
+        edges = {(r["from_asset"], r["to_asset"]) for r in mapper.state["relationships"].values()}
+        assert not any(a == b for a, b in edges)
+
+    def test_explaining_a_self_naming_host_still_works(self, mapper):
+        mapper.ingest_finding(finding("tls_san", TARGET, target=TARGET, source="ssl_analyzer.py"))
+        hops = mapper.explain_asset_path(sm._aid(sm.ASSET_HOSTNAME, TARGET))
+        assert hops and hops[0]["asset_id"] == sm._aid(sm.ASSET_HOSTNAME, TARGET)

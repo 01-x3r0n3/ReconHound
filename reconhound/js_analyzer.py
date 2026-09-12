@@ -100,8 +100,8 @@ via PendingAssetsStore (the same crash-safe, atomic-write store used by
 every other implemented module, sharing the same output file). This module
 does not implement or call into surface_mapper, active_recon,
 tech_fingerprint, vhost_scanner, endpoint_discovery, api_recon, crawler,
-supply_chain, exposure_scan, http_analyzer, ssl_analyzer, screenshot,
-vuln_intel, risk_engine, report_generator, orchestrator, osint_engine, or
+supply_chain, exposure_scan, http_analyzer, ssl_analyzer, vuln_intel,
+risk_engine, report_generator, orchestrator, osint_engine, or
 any other module.
 
 SECURITY BOUNDARIES (context.md §4/§16, assignment's explicit "ACTIVE

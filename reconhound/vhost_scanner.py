@@ -82,8 +82,8 @@ via PendingAssetsStore (the same crash-safe, atomic-write store used by
 every other implemented module, sharing the same output file). This module
 does not implement or call into surface_mapper, active_recon,
 tech_fingerprint, endpoint_discovery, api_recon, crawler, js_analyzer,
-supply_chain, exposure_scan, http_analyzer, ssl_analyzer, screenshot,
-vuln_intel, risk_engine, report_generator, orchestrator, osint_engine,
+supply_chain, exposure_scan, http_analyzer, ssl_analyzer, vuln_intel,
+risk_engine, report_generator, orchestrator, osint_engine,
 passive_recon, passive_intel, code_leak, wayback_intel, or any other module.
 
 DISCOVERY != EXPLOITATION: this module only ever issues read-only GET

@@ -241,6 +241,26 @@ CATCH_ALL_DOMINANCE_MIN_SAMPLES = 5
 # load, so the run is marked incomplete instead — see _EnumerationState.
 RATE_LIMIT_TRIP_THRESHOLD = 3
 
+# Consecutive transport-level failures (timeout, connection refused, DNS
+# failure — never an HTTP response of any status) after which enumeration
+# stops, *and only while no probe in this run has ever been answered*.
+#
+# An origin that answers nothing answers nothing per path: every remaining
+# candidate costs a full `timeout` and can produce no observation. Measured
+# against a port that accepts connections and never replies: 346 probes, 346
+# failures, 71s at timeout=2 and 285s at the orchestrator's default
+# timeout=8, for zero findings. With the tripwire the same origin costs the
+# threshold's worth of probes.
+#
+# The safety conditions are what make this a saving rather than a loss of
+# coverage:
+#   * one answered probe disarms it permanently, so a host that is merely
+#     slow, or that drops a handful of requests, is never cut short;
+#   * a tripped run can never be `enumeration_conclusive`, so nothing is
+#     written into shared negative-result memory and a later run against a
+#     healthy origin repeats the work in full.
+TRANSPORT_FAILURE_TRIP_THRESHOLD = 12
+
 # Explicit API roots named by context.md, plus the no-trailing-slash "graphql"
 # sibling: real GraphQL deployments are mounted at /graphql far more often than
 # at /graphql/, and probing only the slashed form missed them entirely. This
@@ -2231,6 +2251,11 @@ class _EnumerationState:
         self.failed_probes = 0
         self.budget_exhausted = False
         self.cancelled = False
+        # Dead-origin tripwire (TRANSPORT_FAILURE_TRIP_THRESHOLD).
+        self._consecutive_transport_failures = 0
+        self._answered_any = False
+        self.origin_unreachable = False
+        self.skipped_unreachable = 0
         self.errors: List[Dict[str, Any]] = []
         self._baseline_lock = threading.RLock()
         self._baseline_cache: Dict[str, Dict[str, Any]] = {}
@@ -2302,6 +2327,35 @@ class _EnumerationState:
     def count_failed(self) -> None:
         with self._lock:
             self.failed_probes += 1
+            self._consecutive_transport_failures += 1
+            if (not self._answered_any
+                    and not self.origin_unreachable
+                    and self._consecutive_transport_failures >= TRANSPORT_FAILURE_TRIP_THRESHOLD):
+                self.origin_unreachable = True
+                self.errors.append({
+                    "stage": "origin_unreachable", "url": "",
+                    "error": (f"stopped enumerating after {self._consecutive_transport_failures} "
+                              f"consecutive transport failures with no probe ever answered; the "
+                              f"origin is not responding. Remaining candidates were NOT tested and "
+                              f"their absence is not evidence that they do not exist"),
+                    "timestamp": _now(),
+                })
+
+    def count_answered(self) -> None:
+        """
+        One probe got an HTTP response of any status.
+
+        This permanently disarms the dead-origin tripwire: a host that has
+        served a response is up, and later timeouts against it are transient
+        failures, not proof that enumeration is pointless.
+        """
+        with self._lock:
+            self._answered_any = True
+            self._consecutive_transport_failures = 0
+
+    def count_skipped_unreachable(self) -> None:
+        with self._lock:
+            self.skipped_unreachable += 1
 
     def record_error(self, stage: str, url: str, message: str) -> None:
         with self._lock:
@@ -2474,6 +2528,14 @@ def _probe_and_record(
         state.release_request()
         state.count_blocked()
         return None, []
+    if state.origin_unreachable:
+        # The origin stopped answering entirely. No request is sent, so the
+        # reservation goes back to the budget, and the candidate is counted
+        # as *not tested* rather than as a blocked or negative result — it
+        # must never reach the negative-result accounting.
+        state.release_request()
+        state.count_skipped_unreachable()
+        return None, []
 
     resp = fetch_url(url, timeout=timeout)
     if resp["status"] != "found":
@@ -2482,6 +2544,7 @@ def _probe_and_record(
         state.count_failed()
         state.record_error("fetch", url, resp.get("error") or "request failed")
         return None, []
+    state.count_answered()
 
     counted_blocked = False
     if resp["status_code"] == 429:
@@ -2642,6 +2705,11 @@ def _run_probe_batch(
     harvested: set = set()
     try:
         for url, category, discovery_source, technology_association in tasks:
+            if state.origin_unreachable:
+                # Stop submitting as soon as the tripwire fires; the already
+                # submitted futures still complete and are harvested below.
+                state.count_skipped_unreachable()
+                continue
             normalized = _normalize_url(url)
             if not state.mark_visited(normalized):
                 continue
@@ -2957,6 +3025,11 @@ def run_endpoint_discovery(
         "request_budget_exhausted": False,
         "rate_limited": False,
         "cancelled": False,
+        # True when every probe failed at the transport level and none was
+        # ever answered — the origin is not responding, so the remaining
+        # candidates were not tested (see TRANSPORT_FAILURE_TRIP_THRESHOLD).
+        "origin_unreachable": False,
+        "candidates_not_probed_unreachable": 0,
         # True when the run could not judge existence reliably (no usable
         # catch-all baseline, or the enumeration was blocked/truncated). This
         # is the flag that stops downstream reading an empty `endpoints` list
@@ -2999,7 +3072,8 @@ def run_endpoint_discovery(
 
     depth = 0
     frontier = seed_tasks
-    while frontier and depth <= max_depth and not state.budget_exhausted and not state.cancelled:
+    while (frontier and depth <= max_depth and not state.budget_exhausted
+            and not state.cancelled and not state.origin_unreachable):
         results = _run_probe_batch(state, frontier, depth, timeout, max_workers)
         next_frontier: List[_Task] = []
         # Candidates are deduplicated on their raw URL string as the frontier
@@ -3057,6 +3131,8 @@ def run_endpoint_discovery(
     summary["failed_probes"] = state.failed_probes
     summary["requests_made"] = state.request_count
     summary["cancelled"] = state.cancelled
+    summary["origin_unreachable"] = state.origin_unreachable
+    summary["candidates_not_probed_unreachable"] = state.skipped_unreachable
     summary["rate_limited"] = bool(state.rate_limited_roots)
     if state.rate_limited_roots:
         summary["rate_limited_roots"] = sorted(state.rate_limited_roots)
@@ -3123,6 +3199,7 @@ def run_endpoint_discovery(
         and not state.cancelled
         and not state.budget_exhausted
         and not state.rate_limited_roots
+        and not state.origin_unreachable
         and not mostly_unanswered
     )
 

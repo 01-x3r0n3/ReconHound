@@ -91,6 +91,34 @@ STATE_FAILED = "failed"
 VALID_STATES = {STATE_DISCOVERED, STATE_QUEUED, STATE_INVESTIGATED, STATE_COMPLETED, STATE_FAILED}
 
 # ---------------------------------------------------------------------------
+# Conflict kinds (context.md §8)
+# ---------------------------------------------------------------------------
+
+# context.md §8 defines conflict detection as "when modules disagree". Two
+# different things reach _set_attribute() as "a different value for an
+# attribute that already has one", and they are not the same claim:
+#
+#   CONFLICT_CROSS_SOURCE — two or more *different* modules recorded
+#       different values. This is the §8 contradiction: at most one of them
+#       can be describing the asset correctly, so both are preserved and the
+#       disagreement is surfaced for manual resolution.
+#
+#   CONFLICT_TEMPORAL — every recorded value came from the *same* module at
+#       different times. One observer re-observing the world and seeing
+#       something else is a change in the target, not a contradiction between
+#       modules: a rotated DNS answer, a bumped SOA serial, a refreshed WHOIS
+#       record, an upgraded nginx. It is preserved and reported exactly the
+#       same way, but it must not be counted as an inter-module contradiction
+#       and must not suspend an assessment that depends on the current value —
+#       every repeat scan of a live target would otherwise accumulate them and
+#       silently disable its own vulnerability intelligence.
+#
+# Both are preserved in full; the distinction only governs how they are
+# described and what downstream is entitled to conclude from them.
+CONFLICT_CROSS_SOURCE = "cross_source"
+CONFLICT_TEMPORAL = "temporal"
+
+# ---------------------------------------------------------------------------
 # Asset types (context.md §7 unified asset graph)
 # ---------------------------------------------------------------------------
 
@@ -799,6 +827,17 @@ class SurfaceMapper:
         return self._get_or_create_asset(ASSET_FINDING, aid, {"finding_type": finding_type, "detail": value}, finding, obs_id)
 
     def link(self, rel_type: str, from_id: str, to_id: str, finding: Dict[str, Any], obs_id: str) -> Dict[str, Any]:
+        if from_id == to_id:
+            # A relationship from an asset to itself asserts nothing. The
+            # commonest source is a certificate whose SAN list repeats its own
+            # subject — every leaf certificate does — which produced
+            # "example.com was discovered via example.com's certificate SAN":
+            # a one-node cycle in the asset graph, a meaningless row in the
+            # report's relationship inventory, and a discovery chain that
+            # explains a host by itself. The observation that recorded it is
+            # unaffected and still carries the SAN as evidence.
+            return {"id": f"rel:{rel_type}:{from_id}->{to_id}", "rel_type": rel_type,
+                    "from_asset": from_id, "to_asset": to_id, "self_referential": True}
         rel_id = f"rel:{rel_type}:{from_id}->{to_id}"
         rel = self.state["relationships"].get(rel_id)
         if rel is None:
@@ -818,6 +857,11 @@ class SurfaceMapper:
         was already recorded for this (asset, key) by any observation, the
         original value is preserved as-is and the disagreement is recorded
         as a conflict instead of being silently overwritten (context.md §8).
+
+        The conflict record carries a `kind` (CONFLICT_CROSS_SOURCE /
+        CONFLICT_TEMPORAL) saying whether the disagreeing values came from
+        different modules or from one module at different times; see the
+        constants for why downstream must not treat the two alike.
         """
         if value is None:
             return
@@ -867,6 +911,12 @@ class SurfaceMapper:
                     {"value": existing_attr["value"], "source": existing_attr["source"],
                      "observation_id": existing_attr["observation_id"], "timestamp": existing_attr["timestamp"]},
                 ],
+                # Accumulated separately from `observations` so that truncating
+                # the observation list below can never lose the fact that a
+                # second module was involved — which is the whole distinction
+                # between a contradiction and a change over time.
+                "sources": sorted({str(existing_attr.get("source") or "")} - {""}),
+                "kind": CONFLICT_TEMPORAL,
             }
             self.state["conflicts"][conflict_id] = conflict
         entry = {"value": new_value, "source": finding["source"], "observation_id": obs_id, "timestamp": finding["timestamp"]}
@@ -880,6 +930,16 @@ class SurfaceMapper:
             if len(conflict["observations"]) > 50:
                 conflict["observations"] = conflict["observations"][:1] + conflict["observations"][-49:]
                 conflict["truncated"] = True
+        sources = set(conflict.get("sources") or [])
+        sources.update(str(o.get("source") or "") for o in conflict["observations"])
+        sources.update([str(finding.get("source") or "")])
+        sources.discard("")
+        conflict["sources"] = sorted(sources)
+        # A conflict only ever gains sources, so it can be promoted from a
+        # change-over-time to a genuine inter-module contradiction but never
+        # demoted back.
+        conflict["kind"] = (CONFLICT_CROSS_SOURCE if len(conflict["sources"]) > 1
+                            else CONFLICT_TEMPORAL)
         conflict["last_seen"] = finding["timestamp"]
         asset["attributes"].setdefault(attribute, existing_attr)["conflict_id"] = conflict_id
         return conflict

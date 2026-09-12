@@ -86,7 +86,7 @@ via PendingAssetsStore (the same crash-safe, atomic-write store used by
 every other implemented module, sharing the same output file). This module
 does not implement or call into surface_mapper, active_recon, vhost_scanner,
 endpoint_discovery, api_recon, crawler, js_analyzer, supply_chain,
-exposure_scan, http_analyzer, ssl_analyzer, screenshot, vuln_intel,
+exposure_scan, http_analyzer, ssl_analyzer, vuln_intel,
 risk_engine, report_generator, orchestrator, osint_engine, or any other
 module.
 
@@ -188,8 +188,8 @@ LIMITATIONS (known, deliberate, and not silently hidden):
     after hydration, whose bundle is minified/tree-shaken past its version
     strings, or whose markers are injected at runtime, is invisible to this
     module. Adding a headless browser would change this module into
-    something else; the gap is real and belongs to js_analyzer.py/
-    screenshot.py territory, not to a silent pretence of coverage. A run
+    something else; the gap is real and belongs to js_analyzer.py
+    territory, not to a silent pretence of coverage. A run
     that finds nothing therefore records "not checked", not "not present"
     (implementation decision #8).
   * Redirects are not followed (allow_redirects=False, deliberate — redirect

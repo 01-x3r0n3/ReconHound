@@ -2358,5 +2358,117 @@ class TestDegenerateInputs:
         assert deepest["root"] == "https://example.com/deep/"
 
 
+# ---------------------------------------------------------------------------
+# Dead-origin tripwire (TRANSPORT_FAILURE_TRIP_THRESHOLD)
+#
+# Reproduces the performance defect found in the 2026-09-12 whole-system
+# audit: against a port that accepts TCP connections and never answers HTTP,
+# this module sent all 346 candidate probes, every one of them timing out —
+# 71s at timeout=2 and 285s at the orchestrator's default timeout=8, for zero
+# findings and zero usable baselines.
+# ---------------------------------------------------------------------------
+
+
+class TestDeadOriginTripwire:
+    WORDS = [f"path{i}/" for i in range(200)]
+
+    def _wl(self, tmp_path):
+        return _write_wordlist(tmp_path, "directories.txt", self.WORDS)
+
+    def test_enumeration_stops_once_the_origin_stops_answering(self, tmp_path):
+        sent = []
+
+        def never_answers(url, **kwargs):
+            sent.append(url)
+            raise requests.exceptions.Timeout("timed out")
+
+        with mock.patch("requests.get", side_effect=never_answers):
+            summary = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=self._wl(tmp_path), max_depth=1, max_workers=4)
+
+        assert summary["origin_unreachable"] is True
+        # Bounded by the threshold plus whatever the worker pool had already
+        # dispatched when it fired — never the whole wordlist.
+        assert len(sent) < len(self.WORDS), "the whole wordlist was still probed"
+        assert summary["candidates_not_probed_unreachable"] > 0
+
+    def test_a_tripped_run_is_never_conclusive_and_writes_no_negative_result(self, tmp_path):
+        # The safety property: a tripwire must never poison shared
+        # negative-result memory with "checked and not found".
+        out = tmp_path / "out"
+        with mock.patch("requests.get", side_effect=requests.exceptions.Timeout("x")):
+            summary = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(out),
+                wordlists_dir=self._wl(tmp_path), max_depth=1, max_workers=4)
+
+        assert summary["origin_unreachable"] is True
+        assert summary["enumeration_conclusive"] is False
+        assert summary["endpoints"] == []
+        pending = out / "pending_assets.json"
+        blob = pending.read_text() if pending.exists() else ""
+        assert "endpoint_discovery_checked_no_endpoints" not in blob
+
+    def test_the_reason_is_reported_not_silently_swallowed(self, tmp_path):
+        with mock.patch("requests.get", side_effect=requests.exceptions.Timeout("x")):
+            summary = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=self._wl(tmp_path), max_depth=1, max_workers=4)
+        reasons = [e for e in summary["errors"] if e.get("stage") == "origin_unreachable"]
+        assert len(reasons) == 1
+        assert "not evidence" in reasons[0]["error"]
+
+    def test_one_answered_probe_disarms_the_tripwire_permanently(self, tmp_path):
+        # A host that is merely slow, or that drops a burst of requests, must
+        # still be enumerated in full.
+        state = ed._EnumerationState(SAFE_TARGET, None, 100_000, 1, [], [])
+        for _ in range(ed.TRANSPORT_FAILURE_TRIP_THRESHOLD - 1):
+            state.count_failed()
+        assert state.origin_unreachable is False
+        state.count_answered()
+        for _ in range(ed.TRANSPORT_FAILURE_TRIP_THRESHOLD * 5):
+            state.count_failed()
+        assert state.origin_unreachable is False, (
+            "an origin that answered once must never trip the dead-origin wire")
+
+    def test_a_flaky_but_live_origin_is_enumerated_in_full(self, tmp_path):
+        # Every third probe fails; nothing about that means the origin is dead.
+        words = [f"p{i}/" for i in range(30)]
+        seen = []
+
+        def flaky(url, **kwargs):
+            seen.append(url)
+            if len(seen) % 3 == 0:
+                raise requests.exceptions.Timeout("transient")
+            return _fake_response(404, body=b"not found")
+
+        with mock.patch("requests.get", side_effect=flaky):
+            summary = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=_write_wordlist(tmp_path, "directories.txt", words),
+                max_depth=1, max_workers=1)
+
+        assert summary["origin_unreachable"] is False
+        assert summary["candidates_not_probed_unreachable"] == 0
+        assert summary["requests_made"] >= len(words)
+
+    def test_a_404_is_an_answer_not_a_transport_failure(self, tmp_path):
+        with mock.patch("requests.get", side_effect=_all_404):
+            summary = ed.run_endpoint_discovery(
+                SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                wordlists_dir=self._wl(tmp_path), max_depth=1, max_workers=4)
+        assert summary["origin_unreachable"] is False
+        assert summary["requests_made"] >= len(self.WORDS)
+
+    def test_connection_refused_and_dns_failure_trip_it_too(self, tmp_path):
+        for exc in (requests.exceptions.ConnectionError("refused"),
+                    requests.exceptions.ConnectionError("Name or service not known")):
+            with mock.patch("requests.get", side_effect=exc):
+                summary = ed.run_endpoint_discovery(
+                    SAFE_URL, target=SAFE_TARGET, output_dir=str(tmp_path / "out"),
+                    wordlists_dir=self._wl(tmp_path), max_depth=1, max_workers=4)
+            assert summary["origin_unreachable"] is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

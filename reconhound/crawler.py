@@ -2500,10 +2500,16 @@ def run_crawler(
     # the depth limit, the request budget, an interrupt, a rate limit, an
     # anti-bot challenge, or a body too large to parse in full — makes an
     # empty result inconclusive rather than negative (context.md §8).
+    # A crawl that requested pages and never got a single one back did not
+    # see "the whole reachable surface"; it saw nothing, because the base URL
+    # itself never answered. Reporting that as complete told downstream that
+    # this host has no pages, no forms and no JavaScript — the absence-as-fact
+    # conclusion this flag exists to prevent.
     summary["crawl_complete"] = not (
         summary["depth_truncated"] or summary["request_budget_exhausted"]
         or summary["cancelled"] or summary["rate_limited"]
         or summary["challenge_pages"] or summary["truncated_pages"]
+        or (not summary["pages"] and summary["requests_made"] > 0)
     )
 
     summary["errors"] = state.errors

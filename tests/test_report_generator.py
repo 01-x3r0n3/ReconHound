@@ -519,7 +519,10 @@ class TestRobustness:
         first = rg.generate_report(output_dir=pipeline["output_dir"])
         second = rg.generate_report(output_dir=pipeline["output_dir"])
         assert first["output_paths"] == second["output_paths"]
-        assert len(os.listdir(os.path.dirname(first["output_paths"]["html"]))) == 2
+        assert len(os.listdir(os.path.dirname(first["output_paths"]["html"]))) == len(rg.VALID_FORMATS)
+        # No temp file survives a completed write.
+        assert not [n for n in os.listdir(os.path.dirname(first["output_paths"]["html"]))
+                    if n.startswith(".report_")]
         a = json.load(open(first["output_paths"]["json"]))
         b = json.load(open(second["output_paths"]["json"]))
         a.pop("generated_at"), b.pop("generated_at")
@@ -703,9 +706,10 @@ class TestHtmlSafety:
 # ===========================================================================
 
 class TestOutputs:
-    def test_both_formats_are_written_under_output_reports(self, pipeline):
+    def test_all_formats_are_written_under_output_reports(self, pipeline):
         result = rg.generate_report(output_dir=pipeline["output_dir"])
-        assert sorted(result["output_paths"]) == ["html", "json"]
+        assert sorted(result["output_paths"]) == ["html", "json", "text"]
+        assert result["output_paths"]["text"].endswith("reconhound_report.txt")
         for path in result["output_paths"].values():
             assert os.path.isfile(path)
             assert os.path.dirname(path) == os.path.abspath(
@@ -804,3 +808,858 @@ class TestOutputs:
         printed = json.loads(capsys.readouterr().out)
         assert printed["target"] == TARGET
         assert os.path.isfile(printed["output_paths"]["html"])
+
+
+# ===========================================================================
+# Hardening pass (2026-09-11): sanitization, redaction, bounds, validation,
+# ordering, the terminal report, interrupt safety and contract stability.
+#
+# Every test below reproduces a defect that existed before the pass or
+# attacks one of its fixes.
+# ===========================================================================
+
+import copy
+import hashlib
+import io
+import re
+import subprocess
+import time
+
+# Anything a terminal could act on, plus the invisible Unicode format
+# characters that hide or reorder text.
+RAW_CONTROL = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f\x80-\x9f​-‏ -‮⁠-⁤⁦-⁯﻿]")
+ANSI_ESC = re.compile("\x1b\\[")
+
+HOSTILE = (
+    "\x1b]8;;http://evil.example/\x07click here\x1b]8;;\x07 "      # OSC 8 hyperlink
+    "\x1b]52;c;SGVsbG8=\x07 "                                      # OSC 52 clipboard
+    "\x1b[2J\x1b[H\x1b[31m "                                       # CSI clear/home/colour
+    "\x1bP dcs \x1b\\ \x1b_ apc \x1b\\ \x1b^ pm \x1b\\ \x1bX sos \x1b\\ "  # DCS/APC/PM/SOS
+    "\x9b31m \x9d0;t\x9c "                                         # 8-bit CSI / OSC (C1)
+    "\x00 nul \x08 bs \x7f del "                                   # C0 / DEL
+    "‮REVERSED‬ ​zero-width ﻿bom "              # bidi + invisible
+    "\r\n[CRIT][HIGH CONF] fake finding"                            # line fabrication
+)
+
+SECRETS = {
+    "aws": "AKIAIOSFODNN7EXAMPLE",
+    "jwt": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+           "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    "password": "Sup3rS3cretPassw0rd!",
+    "github": "ghp_" + "Q" * 36,
+    "bearer": "ZXhhbXBsZS1iZWFyZXItdG9rZW4tdmFsdWU",
+    "url_pw": "hunter22pw",
+    "pem": "MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn",
+}
+SECRET_TEXT = (
+    f"GET /?api_key={SECRETS['aws']} ; Authorization: Bearer {SECRETS['bearer']} ; "
+    f"password={SECRETS['password']} ; token {SECRETS['github']} ; jwt {SECRETS['jwt']} ; "
+    f"postgres://admin:{SECRETS['url_pw']}@db.internal:5432/app ; "
+    f"-----BEGIN RSA PRIVATE KEY-----\n{SECRETS['pem']}\n-----END RSA PRIVATE KEY-----"
+)
+
+
+def walk_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield key
+            yield from walk_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from walk_strings(item)
+
+
+def file_hash(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+@pytest.fixture
+def state(pipeline):
+    """The three state documents of a real (fake-network) run, as dicts."""
+    out = pipeline["output_dir"]
+    return {
+        "output_dir": out,
+        "graph": json.load(open(os.path.join(out, "surface_graph.json"))),
+        "assessment": json.load(open(os.path.join(out, "risk_assessment.json"))),
+        "execution": json.load(open(os.path.join(out, "orchestrator_run.json"))),
+    }
+
+
+def build_from(state, **overrides):
+    kwargs = {"graph": state["graph"], "assessment": state["assessment"],
+              "execution": state["execution"], "output_dir": state["output_dir"]}
+    kwargs.update(overrides)
+    return rg.build_report_document(**kwargs)
+
+
+def first_signal(assessment):
+    return assessment["signals"][0]
+
+
+class TestSanitizationAtModelEntry:
+    """Target-controlled bytes are neutralized when they enter the document."""
+
+    def test_sanitize_text_neutralizes_every_class_of_attack(self):
+        cleaned, count = rg.sanitize_text(HOSTILE)
+        assert not RAW_CONTROL.search(cleaned)
+        assert count > 20
+        # Nothing hidden: every neutralized character is shown as an escape.
+        assert "\\x1b]52;c;" in cleaned and "\\u202e" in cleaned and "\\x00" in cleaned
+        assert "\\x9b" in cleaned and "\\x7f" in cleaned and "\\ufeff" in cleaned
+        # TAB and LF are legitimate in multi-line evidence and are kept.
+        assert rg.sanitize_text("a\tb\nc") == ("a\tb\nc", 0)
+        assert rg.sanitize_text("") == ("", 0)
+
+    @pytest.fixture
+    def hostile_state(self, state):
+        graph = copy.deepcopy(state["graph"])
+        assessment = copy.deepcopy(state["assessment"])
+        execution = copy.deepcopy(state["execution"])
+        graph["target"] = HOSTILE + TARGET
+        for asset in graph["assets"].values():
+            if isinstance(asset.get("value"), str):
+                asset["value"] = HOSTILE + asset["value"]
+            for attribute in (asset.get("attributes") or {}).values():
+                attribute["value"] = HOSTILE
+        for signal in assessment["signals"]:
+            signal["summary"] = HOSTILE + signal["summary"]
+            signal["evidence"] = [HOSTILE]
+            signal["rationale"] = [HOSTILE]
+            signal["detail"] = {HOSTILE: HOSTILE}
+            signal["provenance"] = [{"source": HOSTILE, "observation_id": HOSTILE,
+                                     "confidence": HOSTILE, "timestamp": HOSTILE}]
+            signal["category"] = HOSTILE
+            signal["severity"] = HOSTILE
+        for entry in assessment["investigation_queue"]:
+            entry["explanation"] = [HOSTILE]
+            entry["value"] = HOSTILE
+        execution["status"] = HOSTILE
+        execution["errors"] = [{"stage": HOSTILE, "error": HOSTILE}]
+        for record in execution["executions"]:
+            record["module"] = HOSTILE
+            record["error"] = HOSTILE
+            record["status"] = "failed"
+        return {"output_dir": state["output_dir"], "graph": graph,
+                "assessment": assessment, "execution": execution}
+
+    def test_no_raw_control_character_survives_into_the_json_model(self, hostile_state):
+        document = build_from(hostile_state)
+        # The data model itself, not just its serialization: a downstream
+        # consumer decoding the JSON gets the same strings.
+        round_tripped = json.loads(json.dumps(document))
+        offenders = [s for s in walk_strings(round_tripped) if RAW_CONTROL.search(s)]
+        assert offenders == []
+        assert document["sanitization"]["control_characters_neutralized"] > 100
+        assert any("control" in line for line in document["limitations"])
+
+    def test_no_control_character_reaches_any_renderer(self, hostile_state):
+        document = build_from(hostile_state)
+        text = rg.render_text_report(document, width=100)
+        assert not RAW_CONTROL.search(text) and not ANSI_ESC.search(text)
+        html_out = rg.render_html_report(document)
+        assert not RAW_CONTROL.search(html_out)
+        assert "\\x1b]52;c;" in text, "the attack is visible, not hidden"
+
+    def test_target_text_cannot_fabricate_a_finding_heading(self, hostile_state):
+        document = build_from(hostile_state)
+        for width in (40, 100):
+            text = rg.render_text_report(document, width=width)
+            fakes = [line for line in text.split("\n") if line.startswith("[CRIT][HIGH CONF] fake")]
+            assert fakes == [], "a wrapped continuation started a line with a badge"
+
+    def test_hostile_target_is_sanitized_in_the_title(self, outdir):
+        mapper = graph_with(outdir, [finding("dns_record", value={"record_type": "A", "records": ["203.0.113.9"]},
+                                             source="passive_recon.py")])
+        state = mapper.state
+        state["target"] = "exa\x1b[31mmple.com"
+        document = rg.build_report_document(graph=state, assessment=None, execution=None, output_dir=outdir)
+        assert "\x1b" not in document["title"] and "\\x1b[31m" in document["title"]
+
+    def test_lone_surrogates_cannot_make_the_report_unwritable(self, state, tmp_path):
+        # Legal in JSON text, unencodable in UTF-8: without sanitization the
+        # text and HTML files fail to write and the terminal print raises.
+        assessment = copy.deepcopy(state["assessment"])
+        lone_surrogate = json.loads('"\\ud800"')
+        first_signal(assessment)["summary"] = lone_surrogate + first_signal(assessment)["summary"]
+        first_signal(assessment)["evidence"] = [f"X-Header: {lone_surrogate}value"]
+        result = rg.generate_report(graph=state["graph"], assessment=assessment,
+                                    execution=state["execution"], output_dir=str(tmp_path))
+        assert result["errors"] == [] and sorted(result["output_paths"]) == ["html", "json", "text"]
+        text = open(result["output_paths"]["text"], encoding="utf-8").read()
+        assert "\\ud800" in text
+
+    def test_out_of_range_timestamps_do_not_crash_the_terminal_renderer(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        first_signal(assessment)["last_seen"] = "9999-12-31T23:59:59-05:00"
+        document = build_from(state, assessment=assessment)
+        text = rg.render_text_report(document, width=100)
+        assert "9999-12-31T23:59:59-05:00" in text
+
+    def test_sanitized_dict_keys_never_collide_silently(self):
+        stats = rg._empty_hardening_stats()
+        out = rg._harden({"\x1b": 1, "\\x1b": 2}, dict(rg.DEFAULT_LIMITS), stats)
+        assert sorted(out) == ["\\x1b", "\\x1b (2)"]
+        assert sorted(out.values()) == [1, 2]
+
+
+class TestRedaction:
+    def test_recognised_credential_shapes_are_masked(self):
+        masked, count = rg.redact_sensitive_text(SECRET_TEXT)
+        for name, secret in SECRETS.items():
+            assert secret not in masked, f"{name} leaked"
+        assert count >= 7
+        assert "-----BEGIN PRIVATE KEY----- <redacted>" in masked
+
+    def test_intelligence_values_stay_readable(self):
+        for text in ("auth_method=bearer", "keyword=recon", "signature_algorithm=sha256WithRSA",
+                     "Bearer token expired", "token expired", "key=abc", "public_key=ssh-rsa AAAAB3",
+                     "csrf_token=present", "api_key=missing", "X-Frame-Options=DENY",
+                     "Set-Cookie: sessionid=; Path=/", "hostname:auth.example.com",
+                     "signal:leaked_credential_in_public_code:49eaa0b3a5dd076a9d96"):
+            assert rg.redact_sensitive_text(text) == (text, 0), text
+
+    def test_redaction_cost_is_linear_in_the_input(self):
+        # `a.b`*1000 and `a-`*1500 made the first version of the assignment
+        # pattern quadratic (0.9 s per 3 KB string).
+        for text in ("a.b" * 1000, "a-" * 1500, "://" * 1000, "a:b@" * 750, "x" * 3000):
+            started = time.perf_counter()
+            rg.redact_sensitive_text(text)
+            assert time.perf_counter() - started < 0.1, text[:8]
+
+    def test_secrets_never_reach_json_html_or_text(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        signal = first_signal(assessment)
+        signal["evidence"] = [SECRET_TEXT]
+        signal["summary"] = f"leak {SECRETS['aws']}"
+        signal["detail"] = {"header": f"Authorization: Bearer {SECRETS['bearer']}"}
+        document = build_from(state, assessment=assessment)
+        serialized = json.dumps(document)
+        html_out = rg.render_html_report(document)
+        text = rg.render_text_report(document, width=100)
+        for name, secret in SECRETS.items():
+            for where, blob in (("json", serialized), ("html", html_out), ("text", text)):
+                assert secret not in blob, f"{name} leaked into {where}"
+        assert document["sanitization"]["secrets_redacted"] >= 7
+        assert any("credential-shaped" in line for line in document["limitations"])
+
+    def test_a_secret_straddling_the_text_bound_is_still_masked(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        limit = rg.DEFAULT_LIMITS["max_text_chars"]
+        first_signal(assessment)["evidence"] = ["x" * (limit - 10) + f" api_key={SECRETS['aws']} tail"]
+        document = build_from(state, assessment=assessment)
+        assert SECRETS["aws"] not in json.dumps(document)
+
+
+class TestBoundedOutput:
+    def test_a_ten_megabyte_evidence_line_is_bounded_with_a_visible_marker(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        signal = first_signal(assessment)
+        signal["evidence"] = ["A" * 10_000_000]
+        document = build_from(state, assessment=assessment)
+        serialized = json.dumps(document)
+        assert len(serialized) < 2_000_000
+        entry = next(e for e in document["findings"]["entries"] if e["signal_id"] == signal["signal_id"])
+        line = entry["evidence"][0]
+        assert line.startswith("A" * 100)
+        assert re.search(r"\[truncated: 9\d{6} more character\(s\) omitted\]$", line)
+        assert document["sanitization"]["strings_truncated"] >= 1
+        assert not any(len(s) > rg.DEFAULT_LIMITS["max_text_chars"] + 100 for s in walk_strings(document))
+
+    def test_a_giant_attribute_collection_is_bounded_with_a_visible_marker(self, state):
+        graph = copy.deepcopy(state["graph"])
+        asset = next(iter(graph["assets"].values()))
+        asset.setdefault("attributes", {})["txt_records"] = {
+            "value": ["x" * 100] * 200_000, "source": "passive_recon.py", "confidence": "HIGH"}
+        started = time.perf_counter()
+        document = build_from(state, graph=graph)
+        assert time.perf_counter() - started < 5
+        assert len(json.dumps(document)) < 2_000_000
+        assert document["sanitization"]["collections_truncated"] >= 1
+        markers = [s for s in walk_strings(document) if s.startswith("<truncated:")]
+        assert any("more item(s) omitted" in m for m in markers)
+
+    def test_pending_opportunities_and_manual_review_are_bounded(self, state):
+        execution = copy.deepcopy(state["execution"])
+        execution.setdefault("opportunities", {})["pending"] = [{"id": f"o{i}"} for i in range(50_000)]
+        execution.setdefault("adaptive", {})["manual_review"] = [{"id": f"m{i}"} for i in range(50_000)]
+        document = build_from(state, execution=execution)
+        section = document["execution"]
+        assert len(section["pending_opportunities"]) == rg.DEFAULT_LIMITS["max_pending_opportunities"]
+        assert section["pending_opportunities_truncation"] == {
+            "shown": 200, "total": 50_000, "truncated": True, "omitted": 49_800}
+        assert len(section["adaptive"]["manual_review"]) == rg.DEFAULT_LIMITS["max_manual_review"]
+        assert section["adaptive"]["manual_review_truncation"]["truncated"] is True
+
+    def test_collection_bound_never_undercuts_a_section_bound(self, state):
+        document = build_from(state, limits={"max_findings": 900, "max_collection_items": 5})
+        assert document["limits"]["max_collection_items"] >= 900
+        assert document["limits"]["max_findings"] == 900
+        assert not [s for s in document["findings"]["entries"] if isinstance(s, str)]
+
+    def test_unknown_limit_is_warned_not_ignored_silently(self, state):
+        document = build_from(state, limits={"max_findingz": 1})
+        assert any("max_findingz" in w for w in document["warnings"])
+
+    def test_text_bound_floor(self, state):
+        document = build_from(state, limits={"max_text_chars": 0})
+        assert document["limits"]["max_text_chars"] == 64
+        assert document["target"] == TARGET
+
+
+class TestFindingValidation:
+    def test_a_signal_with_no_evidence_and_no_trace_is_marked_incomplete(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        signal = first_signal(assessment)
+        signal["evidence"], signal["provenance"], signal["observation_ids"] = [], [], []
+        document = build_from(state, assessment=assessment)
+        entry = next(e for e in document["findings"]["entries"] if e["signal_id"] == signal["signal_id"])
+        assert entry["evidence_status"] == rg.EVIDENCE_INCOMPLETE
+        assert entry["evidence_from"] == "none"
+        assert document["findings"]["incomplete_evidence"] == 1
+        text = rg.render_text_report(document, width=100)
+        assert "[INCOMPLETE_EVIDENCE]" in text
+        assert rg.EVIDENCE_INCOMPLETE in rg.render_html_report(document)
+
+    def test_evidence_less_signals_show_their_observations_evidence(self, state):
+        # risk_engine leaves `evidence` empty on technology observations; the
+        # cited graph observation holds the evidence, and that is shown.
+        document = build_from(state)
+        from_observations = [e for e in document["findings"]["entries"]
+                             if e["evidence_from"] == "observation_records"]
+        assert from_observations, "the fixture run has evidence-less technology observations"
+        for entry in from_observations:
+            assert entry["evidence"] and all("[observation " in line for line in entry["evidence"])
+            assert entry["evidence_status"] == rg.EVIDENCE_SUPPORTED
+        assert document["findings"]["incomplete_evidence"] == 0
+
+    def test_nothing_is_invented_for_an_observation_without_evidence(self, state):
+        graph = copy.deepcopy(state["graph"])
+        assessment = copy.deepcopy(state["assessment"])
+        signal = first_signal(assessment)
+        signal["evidence"] = []
+        for observation_id in signal["observation_ids"]:
+            graph["observations"][observation_id]["evidence"] = []
+        document = build_from(state, graph=graph, assessment=assessment)
+        entry = next(e for e in document["findings"]["entries"] if e["signal_id"] == signal["signal_id"])
+        assert entry["evidence"] == [] and entry["evidence_status"] == rg.EVIDENCE_INCOMPLETE
+
+    def test_malformed_signal_records_are_excluded_and_counted(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        total = len(assessment["signals"])
+        assessment["signals"].extend(["garbage", 42, None, ["x"], {"summary": "no id"}])
+        document = build_from(state, assessment=assessment)
+        assert document["findings"]["malformed_excluded"] == 5
+        assert document["findings"]["total"] == total
+        assert len([e for e in document["errors"] if "malformed signal" in e["error"]]) == 5
+        assert "malformed" in rg.render_text_report(document, width=100)
+
+    def test_duplicate_signals_are_rendered_once(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        assessment["signals"].append(copy.deepcopy(first_signal(assessment)))
+        document = build_from(state, assessment=assessment)
+        ids = [e["signal_id"] for e in document["findings"]["entries"]]
+        assert len(ids) == len(set(ids))
+        assert document["findings"]["duplicates_excluded"] == 1
+        vuln_ids = [e["signal_id"] for e in document["vulnerability_intelligence"]["entries"]]
+        assert len(vuln_ids) == len(set(vuln_ids))
+
+    def test_duplicate_and_malformed_queue_entries_are_excluded(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        assessment["investigation_queue"].append(copy.deepcopy(assessment["investigation_queue"][0]))
+        assessment["investigation_queue"].append("junk")
+        document = build_from(state, assessment=assessment)
+        queue = document["investigation_queue"]
+        asset_ids = [e["asset_id"] for e in queue["entries"]]
+        assert len(asset_ids) == len(set(asset_ids))
+        assert queue["duplicates_excluded"] == 1 and queue["malformed_excluded"] == 1
+
+    def test_queue_is_shown_in_rank_order_whatever_the_file_order(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        assessment["investigation_queue"].reverse()
+        document = build_from(state, assessment=assessment)
+        ranks = [e["rank"] for e in document["investigation_queue"]["entries"]]
+        assert ranks == sorted(ranks)
+
+
+class TestMalformedGraphRecords:
+    def test_cyclic_and_malformed_assets_never_break_the_report_and_are_counted(self, state):
+        graph = copy.deepcopy(state["graph"])
+        asset_id = next(iter(graph["assets"]))
+        cyclic = {"a": 1}
+        cyclic["self"] = cyclic
+        graph["assets"][asset_id]["value"] = cyclic
+        graph["assets"]["bad1"] = None
+        graph["assets"]["bad2"] = {"asset_type": None, "value": [1, 2, {"x": None}]}
+        graph["relationships"]["r1"] = "junk"
+        graph["relationships"]["r2"] = {"from_asset": "bad2", "to_asset": "bad2", "rel_type": None}
+        started = time.perf_counter()
+        document = build_from(state, graph=graph)
+        assert time.perf_counter() - started < 5
+        assert document["asset_inventory"]["malformed_excluded"] == 1
+        assert document["relationships"]["malformed_excluded"] == 1
+        assert any("malformed asset" in e["error"] for e in document["errors"])
+        assert any("malformed relationship" in e["error"] for e in document["errors"])
+        rg.render_text_report(document, width=60)
+        rg.render_html_report(document)
+
+
+class TestDeterministicOrdering:
+    def test_findings_follow_the_documented_order(self, state):
+        document = build_from(state)
+        entries = document["findings"]["entries"]
+        keys = [(-rg.severity_sort_key(e["severity"]),
+                 -risk_engine.confidence_rank(e["confidence"]),
+                 (e["subject"] or {}).get("label", ""), e["signal_id"]) for e in entries]
+        assert keys == sorted(keys)
+        assert document["findings"]["ordering"].startswith("severity desc, confidence desc, affected asset asc")
+
+    def test_asset_breaks_ties_before_signal_id(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        base = first_signal(assessment)
+        clones = []
+        for index, label in enumerate(("zzz.example.com", "aaa.example.com")):
+            clone = copy.deepcopy(base)
+            clone["signal_id"] = f"signal:test:{index}"
+            clone["subject_asset_id"] = f"hostname:{label}"
+            clones.append(clone)
+        assessment["signals"] = clones
+        graph = copy.deepcopy(state["graph"])
+        for label in ("zzz.example.com", "aaa.example.com"):
+            graph["assets"][f"hostname:{label}"] = {"asset_type": "hostname", "value": label}
+        document = build_from(state, graph=graph, assessment=assessment)
+        labels = [e["subject"]["label"] for e in document["findings"]["entries"]]
+        assert labels == ["aaa.example.com", "zzz.example.com"]
+
+    def test_output_is_byte_identical_across_hash_seeds(self, pipeline):
+        script = (
+            "import json,sys; from reconhound import report_generator as rg; "
+            "d = rg.build_report_document(output_dir=sys.argv[1], generated_at='2026-09-11T00:00:00+00:00'); "
+            "sys.stdout.write(json.dumps(d, sort_keys=True)); sys.stdout.write(chr(0)); "
+            "sys.stdout.write(rg.render_text_report(d, width=100))")
+        outputs = []
+        for seed in ("0", "1", "12345"):
+            env = dict(os.environ, PYTHONHASHSEED=seed, PYTHONIOENCODING="utf-8")
+            result = subprocess.run([sys.executable, "-c", script, pipeline["output_dir"]],
+                                    capture_output=True, env=env,
+                                    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            assert result.returncode == 0, result.stderr.decode()
+            outputs.append(result.stdout)
+        assert outputs[0] == outputs[1] == outputs[2]
+        assert b"\x00" in outputs[0] and len(outputs[0]) > 10_000
+
+
+class TestTerminalReport:
+    def test_badges_carry_severity_and_confidence_as_text(self, state):
+        text = rg.render_text_report(build_from(state), width=100)
+        assert "ReconHound Assessment Summary" in text
+        assert re.search(r"\[(CRIT|HIGH|MED|LOW|INFO)\]\[(HIGH|MED|LOW) CONF\]", text)
+        for badge in ("[CRIT]", "[HIGH]", "[MED]", "[LOW]", "[INFO]"):
+            assert badge in text
+        # Every finding heading shows severity and confidence together.
+        headings = [line for line in text.split("\n")
+                    if re.match(r"^\[(CRIT|HIGH|MED|LOW|INFO|UNKN)\]", line)
+                    and any(k in line for k in ("[CONFIRMED]", "[INDICATOR]", "[CVE MATCH]", "[OBSERVED]"))]
+        assert headings and all(" CONF]" in line for line in headings)
+
+    def test_each_finding_shows_asset_modules_evidence_provenance_and_date(self, state):
+        text = rg.render_text_report(build_from(state), width=100)
+        for label in ("Asset:", "Category:", "Modules:", "Confidence:", "Discovered:",
+                      "Evidence:", "Provenance:", "Why this severity:"):
+            assert label in text
+        assert re.search(r"Discovered:\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z", text)
+
+    def test_every_bound_is_stated(self, state):
+        document = build_from(state)
+        text = rg.render_text_report(document, width=100, limits={"terminal_max_findings": 5,
+                                                                   "terminal_max_queue_entries": 2})
+        total = document["findings"]["total"]
+        assert f"Showing 5 of {total} findings; {total - 5} more in the JSON report." in text
+        assert "Showing 2 of" in text
+        full = rg.render_text_report(document, width=100)
+        assert f"Showing {total} of {total} findings." in full
+
+    @pytest.mark.parametrize("width", [20, 40, 80, 120, 200])
+    def test_renders_at_every_width_without_overflow_or_escapes(self, state, width):
+        text = rg.render_text_report(build_from(state), width=width)
+        lines = text.split("\n")
+        assert lines and not any(len(line) > width for line in lines)
+        assert not ANSI_ESC.search(text) and not RAW_CONTROL.search(text)
+        assert "Assessment" in text and "Findings" in text
+
+    def test_all_sections_are_present(self, state):
+        text = rg.render_text_report(build_from(state), width=100)
+        for title in ("Investigation queue", "Findings", "Vulnerability intelligence",
+                      "Attack-surface paths", "Technology stack", "Services and ports",
+                      "Endpoints", "JavaScript assets", "Supply chain", "Conflicting observations",
+                      "Negative results", "Execution", "Warnings, limitations"):
+            assert title in text, title
+
+    def test_absent_assessment_is_stated_not_faked(self, outdir):
+        mapper = graph_with(outdir, [finding("dns_record", value={"record_type": "A", "records": ["203.0.113.9"]},
+                                             source="passive_recon.py")])
+        document = rg.build_report_document(graph=mapper, assessment=None, execution=None, output_dir=outdir)
+        text = rg.render_text_report(document, width=80)
+        assert "not available" in text and rg.NO_ASSESSMENT in text
+        assert "[CRIT] Critical" not in text
+
+    def test_colour_policy(self, monkeypatch):
+        tty = io.StringIO()
+        tty.isatty = lambda: True
+        assert rg.terminal_color_allowed(tty, {"TERM": "xterm"}) is True
+        assert rg.terminal_color_allowed(tty, {"TERM": "xterm", "NO_COLOR": "1"}) is False
+        assert rg.terminal_color_allowed(tty, {"TERM": "dumb"}) is False
+        assert rg.terminal_color_allowed(tty, {"TERM": "xterm", "CI": "true"}) is False
+        assert rg.terminal_color_allowed(io.StringIO(), {"TERM": "xterm"}) is False
+        assert rg.terminal_color_allowed(io.StringIO(), {"TERM": "xterm", "FORCE_COLOR": "1"}) is True
+        assert rg.terminal_color_allowed(io.StringIO(), {"FORCE_COLOR": "1", "NO_COLOR": "1"}) is False
+
+    @pytest.mark.parametrize("env", [{"NO_COLOR": "1"}, {"TERM": "dumb"}, {"CI": "true"}, {}])
+    def test_no_ansi_leaks_into_a_pipe_or_under_no_colour(self, pipeline, env):
+        base = {k: v for k, v in os.environ.items() if k not in ("NO_COLOR", "TERM", "CI", "FORCE_COLOR")}
+        base["TERM"] = "xterm-256color"
+        base.update(env)
+        result = subprocess.run(
+            [sys.executable, "-m", "reconhound.report_generator", "--output-dir",
+             pipeline["output_dir"], "--terminal"],
+            capture_output=True, env=base,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        out = result.stdout.decode("utf-8")
+        assert result.returncode == 0, result.stderr.decode()
+        assert not ANSI_ESC.search(out) and "\x1b" not in out
+        assert "ReconHound Assessment Summary" in out
+
+    def test_colour_is_emitted_on_a_real_tty(self, pipeline):
+        pty = pytest.importorskip("pty")
+        master, slave = pty.openpty()
+        env = {k: v for k, v in os.environ.items() if k not in ("NO_COLOR", "CI")}
+        env.update({"TERM": "xterm-256color", "COLUMNS": "100"})
+        process = subprocess.Popen(
+            [sys.executable, "-m", "reconhound.report_generator", "--output-dir",
+             pipeline["output_dir"], "--terminal"],
+            stdout=slave, stderr=slave, env=env,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        os.close(slave)
+        data = b""
+        while True:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            data += chunk
+        process.wait()
+        os.close(master)
+        assert b"\x1b[" in data
+        assert b"[CRIT]" in data or b"[HIGH]" in data, "badges are text even with colour"
+
+    def test_text_file_output_is_plain(self, pipeline):
+        result = rg.generate_report(output_dir=pipeline["output_dir"])
+        text = open(result["output_paths"]["text"], encoding="utf-8").read()
+        assert not ANSI_ESC.search(text) and not RAW_CONTROL.search(text)
+        assert "ReconHound Assessment Summary" in text
+        assert not any(len(line) > rg.TERMINAL_DEFAULT_WIDTH for line in text.split("\n"))
+
+    def test_standalone_terminal_entry_point(self, pipeline, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["report_generator.py", "--output-dir",
+                                          pipeline["output_dir"], "--terminal", "--width", "80",
+                                          "--no-color"])
+        rg._main()
+        out = capsys.readouterr().out
+        assert "ReconHound Assessment Summary" in out and "\x1b" not in out
+        assert not os.path.exists(os.path.join(pipeline["output_dir"], "reports", "reconhound_report.txt")), \
+            "--terminal prints; it does not write"
+
+    def test_terminal_renderer_survives_marker_strings_in_entry_lists(self, state):
+        document = build_from(state)
+        document["findings"]["entries"].append("<truncated: 3 more item(s) omitted>")
+        document["investigation_queue"]["entries"].append("<truncated: 1 more item(s) omitted>")
+        text = rg.render_text_report(document, width=100)
+        assert "(no summary recorded)" not in text
+
+    def test_rendering_a_large_report_is_fast(self, state):
+        assessment = copy.deepcopy(state["assessment"])
+        base = first_signal(assessment)
+        assessment["signals"] = []
+        for index in range(2000):
+            clone = copy.deepcopy(base)
+            clone["signal_id"] = f"signal:test:{index:05d}"
+            assessment["signals"].append(clone)
+        started = time.perf_counter()
+        document = build_from(state, assessment=assessment)
+        text = rg.render_text_report(document, width=100)
+        assert time.perf_counter() - started < 10
+        assert document["findings"]["total"] == 2000 and document["findings"]["shown"] == 400
+        # The statement distinguishes what the JSON report holds (400) from
+        # what only risk_assessment.json holds (the other 1600).
+        assert ("Showing 100 of 2000 findings; 300 more in the JSON report; 1600 more only in "
+                "risk_assessment.json.") in text
+
+
+class TestInterruptSafety:
+    def test_an_interrupt_mid_write_leaves_the_previous_report_intact(self, pipeline, monkeypatch):
+        first = rg.generate_report(output_dir=pipeline["output_dir"])
+        before = {fmt: file_hash(path) for fmt, path in first["output_paths"].items()}
+        reports_dir = os.path.dirname(first["output_paths"]["json"])
+
+        real_fsync = os.fsync
+
+        def interrupt(fd):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(os, "fsync", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            rg.generate_report(output_dir=pipeline["output_dir"])
+        monkeypatch.setattr(os, "fsync", real_fsync)
+        after = {fmt: file_hash(path) for fmt, path in first["output_paths"].items()}
+        assert after == before
+        assert not [n for n in os.listdir(reports_dir) if n.startswith(".report_")], "temp file left behind"
+
+    def test_a_write_failure_never_masks_itself_or_leaves_temp_files(self, pipeline, monkeypatch):
+        def fail(fd):
+            raise OSError(28, "No space left on device")
+        monkeypatch.setattr(os, "fsync", fail)
+        with pytest.raises(rg.PersistenceError) as excinfo:
+            rg.generate_report(output_dir=pipeline["output_dir"])
+        assert "No space left" in str(excinfo.value)
+        reports_dir = os.path.join(pipeline["output_dir"], "reports")
+        assert not [n for n in os.listdir(reports_dir) if n.startswith(".report_")]
+
+    def test_the_rename_is_committed_to_the_directory(self, pipeline, monkeypatch):
+        synced = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            if flags == os.O_RDONLY and os.path.isdir(path):
+                synced.append(path)
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+        result = rg.generate_report(output_dir=pipeline["output_dir"], formats=["json"])
+        assert os.path.dirname(result["output_paths"]["json"]) in synced
+
+
+class TestContractStability:
+    SCHEMA_1_0_TOP_LEVEL = {
+        "asset_inventory", "attack_surface_paths", "conflicts", "endpoints", "errors", "execution",
+        "executive_summary", "findings", "generated_at", "investigation_queue", "javascript",
+        "limitations", "module", "negative_results", "notes", "observations", "relationships",
+        "report_schema_version", "scan", "services", "severity", "source_artifacts", "supply_chain",
+        "target", "technologies", "title", "vulnerability_intelligence", "warnings",
+    }
+    SCHEMA_1_0_FINDING = {
+        "signal_id", "category", "kind", "kind_label", "severity", "severity_reported",
+        "base_severity", "severity_basis", "confidence", "summary", "subject", "sources",
+        "corroborating_sources", "evidence", "evidence_truncation", "provenance",
+        "provenance_truncation", "observation_ids", "rationale", "notes", "factors", "detail",
+        "confirmed", "suspended", "suspension_reason", "stale", "age_days", "conflicts", "last_seen",
+    }
+
+    def test_schema_1_0_keys_are_all_still_present(self, state):
+        document = build_from(state)
+        assert self.SCHEMA_1_0_TOP_LEVEL <= set(document)
+        assert self.SCHEMA_1_0_FINDING <= set(document["findings"]["entries"][0])
+        assert document["report_schema_version"] == "1.1"
+        assert set(document["sanitization"]) == {
+            "control_characters_neutralized", "secrets_redacted", "strings_truncated",
+            "collections_truncated"}
+
+    def test_generate_report_result_shape_is_unchanged_for_old_callers(self, pipeline):
+        result = rg.generate_report(output_dir=pipeline["output_dir"], formats=["html", "json"])
+        assert sorted(result["output_paths"]) == ["html", "json"]
+        assert result["formats"] == ["html", "json"]
+        for key in ("module", "report_schema_version", "target", "generated_at", "formats",
+                    "output_paths", "reports_dir", "summary", "warnings", "limitations", "errors",
+                    "persisted"):
+            assert key in result
+
+    def test_source_state_files_are_untouched_by_reporting(self, pipeline):
+        out = pipeline["output_dir"]
+        names = ("surface_graph.json", "risk_assessment.json", "orchestrator_run.json",
+                 "pending_assets.json")
+        before = {n: file_hash(os.path.join(out, n)) for n in names if os.path.exists(os.path.join(out, n))}
+        rg.generate_report(output_dir=out)
+        document = rg.build_report_document(output_dir=out)
+        rg.render_text_report(document, width=60)
+        after = {n: file_hash(os.path.join(out, n)) for n in before}
+        assert after == before
+
+    def test_the_json_report_is_valid_and_hardened(self, pipeline):
+        result = rg.generate_report(output_dir=pipeline["output_dir"])
+        document = json.load(open(result["output_paths"]["json"], encoding="utf-8"))
+        assert "sanitization" in document and "limits" in document
+        assert not [s for s in walk_strings(document) if RAW_CONTROL.search(s)]
+
+    def test_no_phantom_findings_and_full_provenance(self, state):
+        document = build_from(state)
+        signal_ids = {s["signal_id"] for s in state["assessment"]["signals"]}
+        for entry in document["findings"]["entries"]:
+            assert entry["signal_id"] in signal_ids, "a finding not in the assessment"
+            assert entry["sources"], "a finding without a producing module"
+            assert entry["subject"] is not None
+            if entry["evidence_status"] == rg.EVIDENCE_SUPPORTED:
+                assert entry["evidence"] and (entry["provenance"] or entry["observation_ids"])
+
+
+# ===========================================================================
+# Conflict kinds in the report
+#
+# The 2026-09-12 whole-system audit found the report describing all seven of
+# a real run's conflicts as "contradiction(s) between modules" when every one
+# of them was a single module's own observation changing between runs — a
+# bumped SOA serial, a refreshed WHOIS record, a rotated A record. The report
+# must describe what actually happened.
+# ===========================================================================
+
+
+class TestConflictKindWording:
+    def _temporal_graph(self, outdir):
+        return graph_with(outdir, [
+            finding("tech_fingerprint_detected",
+                    value={"technology": "nginx", "category": "server", "version": "1.18.0",
+                           "url": "https://example.com/"},
+                    source="tech_fingerprint.py", timestamp="2026-07-01T00:00:00+00:00"),
+            finding("tech_fingerprint_detected",
+                    value={"technology": "nginx", "category": "server", "version": "1.20.1",
+                           "url": "https://example.com/"},
+                    source="tech_fingerprint.py", timestamp="2026-08-01T00:00:00+00:00"),
+        ])
+
+    def _cross_source_graph(self, outdir):
+        return graph_with(outdir, [
+            finding("tech_fingerprint_detected",
+                    value={"technology": "nginx", "category": "server", "version": "1.18.0",
+                           "url": "https://example.com/"},
+                    source="tech_fingerprint.py", timestamp="2026-08-01T00:00:00+00:00"),
+            finding("tech_fingerprint_detected",
+                    value={"technology": "nginx", "category": "server", "version": "1.20.1",
+                           "url": "https://example.com/"},
+                    source="active_recon.py", timestamp="2026-08-01T00:01:00+00:00"),
+        ])
+
+    def test_a_temporal_conflict_is_not_called_a_contradiction_between_modules(self, outdir):
+        document = rg.build_report_document(graph=self._temporal_graph(outdir), output_dir=outdir)
+        assert document["conflicts"]["total"] == 1
+        assert document["conflicts"]["temporal_total"] == 1
+        assert document["conflicts"]["cross_source_total"] == 0
+        headline = " ".join(document["executive_summary"]["headline"])
+        assert "contradiction(s) between modules" not in headline
+        assert "different times" in headline
+
+    def test_a_cross_source_conflict_is_still_called_one(self, outdir):
+        document = rg.build_report_document(graph=self._cross_source_graph(outdir), output_dir=outdir)
+        assert document["conflicts"]["cross_source_total"] == 1
+        assert document["conflicts"]["temporal_total"] == 0
+        assert "contradiction(s) between modules" in " ".join(document["executive_summary"]["headline"])
+
+    def test_every_conflict_entry_states_its_kind(self, outdir):
+        document = rg.build_report_document(graph=self._temporal_graph(outdir), output_dir=outdir)
+        entry = document["conflicts"]["entries"][0]
+        assert entry["kind"] == risk_engine.CONFLICT_TEMPORAL
+        assert "different times" in entry["kind_explanation"]
+        # Both values are still shown; classification never drops evidence.
+        assert {o["value"] for o in entry["observations"]} == {"1.18.0", "1.20.1"}
+
+    def test_the_summary_counts_every_conflict_not_only_the_displayed_ones(self, outdir):
+        records = []
+        for i in range(6):
+            for version, source in (("1.18.0", "tech_fingerprint.py"),
+                                    ("1.20.1", "active_recon.py")):
+                records.append(finding(
+                    "tech_fingerprint_detected",
+                    value={"technology": f"tech{i}", "category": "server", "version": version,
+                           "url": "https://example.com/"},
+                    source=source, timestamp="2026-08-01T00:00:00+00:00"))
+        document = rg.build_report_document(
+            graph=graph_with(outdir, records), output_dir=outdir,
+            limits={"max_conflicts": 2})
+        assert document["conflicts"]["truncated"] is True
+        assert len(document["conflicts"]["entries"]) == 2
+        assert document["conflicts"]["cross_source_total"] == 6
+
+    def test_the_terminal_panel_reports_the_breakdown(self, outdir):
+        document = rg.build_report_document(graph=self._temporal_graph(outdir), output_dir=outdir)
+        text = rg.render_text_report(document)
+        assert "changed between observations" in text
+        assert "unresolved contradiction(s) between modules" not in text
+
+    def test_a_pre_breakdown_document_still_renders_without_claiming_a_kind(self, outdir):
+        # A JSON report written before the breakdown existed must not be
+        # rendered as though every conflict were one kind or the other.
+        document = rg.build_report_document(graph=self._temporal_graph(outdir), output_dir=outdir)
+        document["executive_summary"].pop("unresolved_conflicts_cross_source", None)
+        document["executive_summary"].pop("unresolved_conflicts_temporal", None)
+        text = rg.render_text_report(document)
+        assert "unresolved contradiction(s) between modules" not in text
+        assert "1 unresolved" in text
+
+
+class TestUnreachableOriginsAreReported:
+    """
+    An origin that answered nothing is a hole in coverage, not a clean
+    result. The 2026-09-12 whole-system audit found a run in which half the
+    web origins were never reached reporting "The run finished with status
+    completed and no module failures" and nothing else.
+    """
+
+    def _execution_with_unreachable(self, origins):
+        return {
+            "module": "orchestrator.py", "target": TARGET, "status": "completed",
+            "mode": "full-scan", "executions": [], "errors": [], "phases": [],
+            "coverage": {"complete": False,
+                         "unreachable_origins": [{"origin": o, "reported_as": "unreachable"}
+                                                 for o in origins],
+                         "budgets": {}},
+        }
+
+    def test_an_unreachable_origin_becomes_a_stated_limitation(self, outdir):
+        graph = graph_with(outdir, [finding(
+            "dns_record", value={"record_type": "A", "records": ["203.0.113.1"]})])
+        document = rg.build_report_document(
+            graph=graph, output_dir=outdir,
+            execution=self._execution_with_unreachable(["http://example.com:8080"]))
+        limitations = " ".join(document["limitations"])
+        assert "http://example.com:8080" in limitations
+        assert "absence of coverage, not absence" in limitations
+
+    def test_an_unreachable_origin_is_not_counted_as_a_failed_module(self, outdir):
+        graph = graph_with(outdir, [finding(
+            "dns_record", value={"record_type": "A", "records": ["203.0.113.1"]})])
+        document = rg.build_report_document(
+            graph=graph, output_dir=outdir,
+            execution=self._execution_with_unreachable(["http://example.com:8080"]))
+        assert document["execution"]["failed_modules"] == []
+        assert len(document["execution"]["unreachable_origins"]) == 1
+
+    def test_a_run_with_no_unreachable_origin_states_no_such_limitation(self, outdir):
+        graph = graph_with(outdir, [finding(
+            "dns_record", value={"record_type": "A", "records": ["203.0.113.1"]})])
+        document = rg.build_report_document(
+            graph=graph, output_dir=outdir, execution=self._execution_with_unreachable([]))
+        assert not any("answered no request" in line for line in document["limitations"])
+
+    @pytest.mark.parametrize("coverage", [
+        None, {}, "x", {"unreachable_origins": None}, {"unreachable_origins": "x"},
+        {"unreachable_origins": [None, 3, {}, {"origin": ""}]},
+    ])
+    def test_a_malformed_coverage_block_never_breaks_the_report(self, outdir, coverage):
+        graph = graph_with(outdir, [finding(
+            "dns_record", value={"record_type": "A", "records": ["203.0.113.1"]})])
+        execution = {"module": "orchestrator.py", "target": TARGET, "status": "completed",
+                     "mode": "full-scan", "executions": [], "errors": [], "phases": [],
+                     "coverage": coverage}
+        document = rg.build_report_document(graph=graph, output_dir=outdir, execution=execution)
+        assert document["execution"]["unreachable_origins"] == []
+
+    def test_the_summary_panel_coverage_line_names_unreachable_origins(self, outdir):
+        graph = graph_with(outdir, [finding(
+            "dns_record", value={"record_type": "A", "records": ["203.0.113.1"]})])
+        document = rg.build_report_document(
+            graph=graph, output_dir=outdir,
+            execution=self._execution_with_unreachable(["http://example.com:8080"]))
+        text = rg.render_text_report(document)
+        coverage = [l for l in text.splitlines() if "Coverage:" in l]
+        assert coverage and "origin(s) never answered" in coverage[0], coverage

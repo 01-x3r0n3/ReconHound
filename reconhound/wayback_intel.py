@@ -138,7 +138,7 @@ every other implemented module, sharing the same output file). Output is
 intended to feed surface_mapper.py (module 6, not yet implemented) — this
 module does not implement or call into surface_mapper, active_recon,
 tech_fingerprint, vhost_scanner, api_recon, js_analyzer, supply_chain,
-http_analyzer, ssl_analyzer, screenshot, vuln_intel, risk_engine,
+http_analyzer, ssl_analyzer, vuln_intel, risk_engine,
 report_generator, orchestrator, or any other module not already
 implemented.
 

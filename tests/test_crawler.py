@@ -979,6 +979,37 @@ class TestCompletenessSemantics:
         assert r["crawl_complete"] is False
         assert r["requests_made"] == 5
 
+    def test_a_crawl_that_never_reached_its_base_url_is_not_complete(self, tmp_path):
+        # 2026-09-12 whole-system audit: against an origin that accepted TCP
+        # and never answered HTTP, the crawler reported crawl_complete=True
+        # with one request, one fetch error and zero pages — which downstream
+        # reads as "this host has no pages, no forms and no JavaScript". That
+        # is the absence-as-fact conclusion this flag exists to prevent.
+        with mock.patch("requests.get", side_effect=requests.exceptions.Timeout("timed out")):
+            r = cr.run_crawler(SAFE_URL, target=SAFE_TARGET,
+                               output_dir=str(tmp_path / "o"), max_depth=2)
+        assert r["pages"] == []
+        assert r["requests_made"] == 1
+        assert r["crawl_complete"] is False
+        assert r["status"] == "completed_with_errors"
+
+    def test_a_connection_refused_base_url_is_not_a_complete_crawl(self, tmp_path):
+        with mock.patch("requests.get",
+                        side_effect=requests.exceptions.ConnectionError("refused")):
+            r = cr.run_crawler(SAFE_URL, target=SAFE_TARGET,
+                               output_dir=str(tmp_path / "o"), max_depth=1)
+        assert r["crawl_complete"] is False
+
+    def test_a_404_base_url_is_still_a_complete_crawl(self, tmp_path):
+        # A host that answers 404 answered. There is nothing more to crawl,
+        # and that is a real negative result, not an unreached origin.
+        with mock.patch("requests.get", side_effect=_routed(
+                {"/": (404, {"Content-Type": "text/html"}, b"nope")})):
+            r = cr.run_crawler(SAFE_URL, target=SAFE_TARGET,
+                               output_dir=str(tmp_path / "o"), max_depth=1)
+        assert r["pages"], "a 404 is a page record"
+        assert r["crawl_complete"] is True
+
     def test_a_genuinely_finished_crawl_is_complete(self, tmp_path):
         with mock.patch("requests.get", side_effect=_routed({"/": (200, {"Content-Type": "text/html"}, b"done")})):
             r = cr.run_crawler("https://example.com/", target="example.com",
